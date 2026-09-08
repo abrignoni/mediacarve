@@ -1,0 +1,46 @@
+{
+  "media": [
+    {
+      "name": "plain.jpg",
+      "kind": "jpeg",
+      "length": 10398,
+      "sha256": "c2e7569a37ae89e76ee22feedff690032efe984b6c7b5e5f0ea7c86a8c11a615"
+    },
+    {
+      "name": "thumbed.jpg",
+      "kind": "jpeg",
+      "length": 47117,
+      "sha256": "794255bd9659011c617b9af8fdb3e20a76a3d086b24a6abe4cfea163821a98c3"
+    },
+    {
+      "name": "plain.png",
+      "kind": "png",
+      "length": 5501,
+      "sha256": "85cc56a9a736932c286ee7b70ba079630a9cf2eef03bb7ce351b10a9f21df0a3"
+    },
+    {
+      "name": "plain.gif",
+      "kind": "gif",
+      "length": 144,
+      "sha256": "6e3595d80a342d219573a1f9ad00860de47f494fccf557900d82d749fe9a4671"
+    },
+    {
+      "name": "plain.webp",
+      "kind": "webp",
+      "length": 2194,
+      "sha256": "2991d1b853c833219319dd3d7e20d7b67438b0e1d34ddbd31dc54e77f42a98d2"
+    },
+    {
+      "name": "plain.mp4",
+      "kind": "mp4",
+      "length": 45601,
+      "sha256": "a05bdbbe6eb3536a770d190811f39d9004b091c23dffd883c166032f21d863b6"
+    },
+    {
+      "name": "plain.avi",
+      "kind": "avi",
+      "length": 64368,
+      "sha256": "e04016cbc3b25a9f45dc15887083e427a4584810738bf89602d128dec9b94bcb"
+    }
+  ]
+}
