@@ -186,6 +186,42 @@ def test_an_ftyp_box_alone_is_not_a_file():
     assert [h for h in mediacarve.carve(stream) if h.kind in ("mp4", "heic")] == []
 
 
+def _box(kind: bytes, payload: bytes = b"") -> bytes:
+    return struct.pack(">I", 8 + len(payload)) + kind + payload
+
+
+def test_a_vendor_box_after_ftyp_does_not_end_the_file():
+    """Writers add top-level boxes of their own. Four screen recordings on one
+    Windows volume each carried a "beam" box between ftyp and moov, and the
+    deleted one, intact in free space, was the only recoverable file there.
+    The walk used to stop at the first box it did not know."""
+    clip = (_box(b"ftyp", b"mp42\x00\x00\x00\x00mp42isom") + _box(b"beam", b"\x00" * 16)
+            + _box(b"moov", b"m" * 200) + _box(b"mdat", b"d" * 3000))
+    stream = _image([(4096, clip)])
+    hits = [h for h in mediacarve.carve(stream) if h.kind == "mp4"]
+    assert [(h.offset, h.length) for h in hits] == [(4096, len(clip))]
+
+
+def test_ftyp_followed_only_by_unknown_boxes_is_still_not_a_file():
+    """Skipping vendor boxes must not let ftyp plus nothing it recognises through:
+    the file still has to show a box the carver knows."""
+    clip = _box(b"ftyp", b"mp42\x00\x00\x00\x00mp42isom") + _box(b"beam", b"\x00" * 16) \
+        + _box(b"zzzz", b"\x00" * 40)
+    stream = _image([(4096, clip)])
+    assert [h for h in mediacarve.carve(stream) if h.kind in ("mp4", "heic")] == []
+
+
+def test_bytes_that_are_not_a_box_still_end_the_file():
+    """A real box type is four printable characters. Data that is not ends the
+    walk exactly as before, so a file cannot run on into what follows it."""
+    clip = (_box(b"ftyp", b"mp42\x00\x00\x00\x00mp42isom") + _box(b"moov", b"m" * 200)
+            + _box(b"mdat", b"d" * 3000))
+    junk = b"\x00\x00\x10\x00" + b"\x01\x02\x03\x04" + b"j" * 4096   # sane size, not a type
+    stream = _image([(4096, clip + junk)])
+    hits = [h for h in mediacarve.carve(stream) if h.kind == "mp4"]
+    assert [(h.offset, h.length) for h in hits] == [(4096, len(clip))]
+
+
 # ---------------------------------------------------------------------- rate
 
 def _prose(n, seed=1):
