@@ -222,6 +222,109 @@ def test_bytes_that_are_not_a_box_still_end_the_file():
     assert [(h.offset, h.length) for h in hits] == [(4096, len(clip))]
 
 
+
+# ------------------------------------------------------------------- ceilings
+
+_FTYP = struct.pack(">I", 24) + b"ftyp" + b"mp42\x00\x00\x00\x00mp42isom"
+
+
+def _avi(body_bytes: int) -> bytes:
+    body = b"AVI " + b"LIST" + b"\x00" * body_bytes
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def test_an_avi_over_a_mebibyte_is_recovered():
+    """The ceiling for a RIFF file is the one its form names. It used to be looked
+    up under "riff", which has no ceiling of its own, so it fell to 1 MiB and an
+    AVI or WebP larger than that was not reported at all."""
+    avi = _avi(2 << 20)
+    stream = _image([(4096, avi)])
+    assert [(h.offset, h.length, h.kind, h.bounded) for h in mediacarve.carve(stream)] \
+        == [(4096, len(avi), "avi", "header")]
+
+
+def test_a_video_whose_index_follows_its_media_data_keeps_the_index():
+    """Phones write ftyp, mdat, then moov. The box walk used to stop at 1 MiB (the
+    ceiling was looked up under "bmff"), so once mdat crossed that the moov box
+    after it was left out and the carved file had no index."""
+    clip = _FTYP + _box(b"mdat", b"d" * (2 << 20)) + _box(b"moov", b"m" * 200)
+    stream = _image([(4096, clip)])
+    assert [(h.offset, h.length, h.kind, h.bounded) for h in mediacarve.carve(stream)] \
+        == [(4096, len(clip), "mp4", "header")]
+
+
+def test_a_ceiling_given_for_a_kind_is_the_one_applied():
+    avi = _avi(500_000)
+    clip = _FTYP + _box(b"moov", b"m" * 200) + _box(b"mdat", b"d" * 500_000)
+    stream = _image([(4096, avi), (1 << 20, clip)])
+    assert sorted(h.kind for h in mediacarve.carve(stream)) == ["avi", "mp4"]
+    stream.seek(0)
+    hits = list(mediacarve.carve(stream, caps={"avi": 100_000, "mp4": 100_000}))
+    # RIFF records one size, so a file over its ceiling is not that file; a box
+    # walk that passes its ceiling is cut there and says so
+    assert [(h.kind, h.length, h.bounded) for h in hits] == [("mp4", 100_000, "capped")]
+
+
+def test_a_box_that_declares_more_than_the_ceiling_is_capped():
+    """A box size is whatever four (or eight) bytes say. The walk stopped at the
+    ceiling but returned the sum it had reached, so one box declaring 150 GiB
+    came back as a 150 GiB file."""
+    huge = struct.pack(">I", 1) + b"mdat" + struct.pack(">Q", 150 << 30)
+    clip = _FTYP + _box(b"moov", b"m" * 200) + huge
+    stream = _image([(4096, clip)], size=8 << 20)
+    hits = list(mediacarve.carve(stream, caps={"mp4": 1 << 20}))
+    assert [(h.offset, h.length, h.kind, h.bounded) for h in hits] \
+        == [(4096, 1 << 20, "mp4", "capped")]
+
+
+def test_no_hit_runs_past_the_end_of_the_stream():
+    """A header can record a size the stream does not hold: a file cut off by the
+    end of the image, or a false size. The extent ends where the stream does."""
+    size = 1 << 20
+    huge = struct.pack(">I", 1) + b"mdat" + struct.pack(">Q", 150 << 30)
+    clip = _FTYP + _box(b"moov", b"m" * 200) + huge
+    stream = _image([(4096, clip)], size=size)
+    assert [(h.offset, h.length, h.bounded) for h in mediacarve.carve(stream)] \
+        == [(4096, size - 4096, "capped")]
+    avi = b"RIFF" + struct.pack("<I", 900_000) + b"AVI LIST"
+    stream = _image([(8192, avi)], size=size // 2)
+    assert [(h.offset, h.length, h.kind, h.bounded) for h in mediacarve.carve(stream)] \
+        == [(8192, size // 2 - 8192, "avi", "capped")]
+
+
+def test_a_file_that_ends_with_the_stream_is_not_called_capped():
+    clip = _FTYP + _box(b"moov", b"m" * 200) + _box(b"mdat", b"d" * 3000)
+    stream = io.BytesIO(b"\x00" * 4096 + clip)
+    assert [(h.offset, h.length, h.bounded) for h in mediacarve.carve(stream)] \
+        == [(4096, len(clip), "header")]
+
+
+def test_clip_keeps_every_hit_inside_the_range_scanned():
+    """A caller that scans chosen ranges (the free runs of a volume, say) passes
+    ``clip`` so a file found in one range cannot claim the bytes after it. Without
+    it a hit ends where its own structure says, and hits from two ranges can
+    overlap."""
+    span = 64 * 1024
+    first = _FTYP + _box(b"moov", b"m" * 200) + struct.pack(">I", 3 << 20) + b"mdat"
+    second = _FTYP + _box(b"moov", b"m" * 200) + _box(b"mdat", b"d" * 3000)
+    stream = _image([(0, first), (1 << 20, second)], size=4 << 20)
+    spans = ((0, span), (1 << 20, span))
+
+    def scan(**kw):
+        return [(h.offset, h.length, h.bounded) for at, n in spans
+                for h in mediacarve.carve(stream, start=at, end=at + n, **kw)]
+
+    whole = len(first) - 8 + (3 << 20)
+    assert scan() == [(0, whole, "header"), (1 << 20, len(second), "header")]
+    assert scan(clip=True) == [(0, span, "capped"), (1 << 20, len(second), "header")]
+
+
+def test_a_clipped_remainder_below_the_floor_is_not_a_file():
+    clip = _FTYP + _box(b"moov", b"m" * 200) + _box(b"mdat", b"d" * 3000)
+    stream = _image([(4096, clip)])
+    assert list(mediacarve.carve(stream, start=0, end=4096 + 512, clip=True)) == []
+
+
 # ---------------------------------------------------------------------- rate
 
 def _prose(n, seed=1):
