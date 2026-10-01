@@ -46,13 +46,24 @@ length was arrived at:
 | --- | --- |
 | `header` | the file's own header or box structure gave the length |
 | `parsed` | the length came from walking the file's internal structure |
-| `capped` | neither was available, so the length is a ceiling and not a fact |
+| `capped` | the extent was cut at a limit, so the length is a ceiling and not a fact |
 
 JPEG walks its markers rather than searching for the end-of-image marker, which
 matters because an EXIF thumbnail is a whole JPEG inside the APP1 segment: the
 segment's own length steps over it, so the thumbnail neither truncates the file
 nor gets reported as a second one. PNG sums chunks to IEND, GIF walks blocks to
 the trailer, and RIFF and ISO-BMFF read their own recorded sizes.
+
+A recorded size is only what the bytes say, so three limits apply and a hit cut
+at one is reported as `capped`:
+
+- the ceiling for its kind (`caps`, 4 GiB for video by default). One ISO-BMFF
+  box with a 64-bit size can declare more than any disk holds.
+- the end of the stream. A header can record more than the stream has left.
+- with `clip=True`, the `end` of the range scanned. Use it when scanning chosen
+  ranges, such as a volume's free runs, where the bytes after a range are not the
+  file's to claim. Without it a file that starts inside the range ends where its
+  own structure says, and hits from two ranges can overlap.
 
 Files found inside another file are suppressed by default and reported with
 `nested=True`. On an MJPG AVI that is the difference between one video and the
@@ -106,7 +117,18 @@ proving that zero can be non-zero.
 accepting a JPEG with no scan segment, dropping the length floor, skipping the
 ftyp validation, and finding the JPEG end by searching for `ffd9` instead of
 walking markers. Each is isolated so it fails its own test rather than being
-caught by a neighbouring guard.
+caught by a neighbouring guard. Six more do the same for the limits above: each
+of the three cuts removed, the floor after a cut removed, and the ceiling looked
+up under the container's name instead of the kind's, for RIFF and for ISO-BMFF.
+
+**Ceilings per kind.** Up to 0.1.0 the ceiling for RIFF and ISO-BMFF was looked
+up under the container's name, which has none, so it fell to 1 MiB. An AVI or
+WebP over 1 MiB was not reported, and an MP4 whose `moov` box follows an `mdat`
+that crosses 1 MiB was reported without it. Measured on a 1.1 GiB exFAT test
+volume where the scan reports 8 MP4 files: 4 came back short by exactly their
+`moov` box (7,407 to 16,240 bytes) with 0.1.0, and whole with 0.2.0. The other
+259 hits on that volume, and all 2,861 on two more test volumes, were the same
+in both.
 
 ## Tests
 
