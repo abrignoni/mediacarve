@@ -34,6 +34,19 @@ library only. Choose an image, optionally limit the kinds, then **Count** to lis
 file found or **Carve** to write them to a folder or zip, with a progress bar. The window
 runs `mediacarve.py` and shows what it prints, so the results are the same either way.
 
+## Standalone executables
+
+Each [release](https://github.com/abrignoni/mediacarve/releases) carries `mediacarve`
+and its window `mediacarve_gui` built as single executables for Windows x64 and arm64,
+macOS on Apple silicon and Intel, and Linux x64 and arm64, beside `mediacarve.py`
+itself. They carry [ewfprobe](https://github.com/abrignoni/ewfprobe), so they read
+`.E01` images, and its licence is in each archive. The workflow that builds them
+(`.github/workflows/build-executables.yml`) requires each executable, and the window
+through its `--cli`, to print and write the same bytes as `python mediacarve.py` on a
+raw image built from the media fixtures and on an E01 from ewfprobe's fixtures, and
+checks the window starts and stays up. The executables are not code signed; the README
+inside each archive says what Windows SmartScreen and macOS Gatekeeper will ask.
+
 ## Why this exists
 
 The established carvers are PhotoRec and Scalpel, both GPL. This one exists so
