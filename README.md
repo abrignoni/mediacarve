@@ -16,6 +16,24 @@ disk, a file inside an archive, or an E01 opened with
 [ewfprobe](https://github.com/abrignoni/ewfprobe). It never writes to what it
 reads.
 
+From the command line:
+
+```bash
+python3 mediacarve.py list disk.raw            # count what is recoverable
+python3 mediacarve.py carve disk.raw -o out/   # write it to a folder, or to a .zip
+```
+
+## In a window
+
+```bash
+python3 mediacarve_gui.py
+```
+
+`mediacarve_gui.py` is an optional tkinter window over the same command line, standard
+library only. Choose an image, optionally limit the kinds, then **Count** to list every
+file found or **Carve** to write them to a folder or zip, with a progress bar. The window
+runs `mediacarve.py` and shows what it prints, so the results are the same either way.
+
 ## Why this exists
 
 The established carvers are PhotoRec and Scalpel, both GPL. This one exists so
