@@ -66,7 +66,7 @@ mediacarve list  disk.raw -v                 # one line per file
 mediacarve carve disk.raw -o carved/         # write the files out
 mediacarve carve disk.raw -o carved.zip      # or into a zip
 mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic
-mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, wav, aiff, caf
+mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, wav, aiff, caf, mp3
 ```
 
 ## Lengths are parsed, not guessed
@@ -89,6 +89,11 @@ every critical chunk, GIF walks blocks to the trailer, and RIFF and ISO-BMFF rea
 their own recorded sizes once the file opens with the chunk or box its format
 requires: `LIST hdrl` for AVI, a VP8 chunk for WebP, `fmt ` and `data` for WAV,
 `COMM` for AIFF and AIFF-C, and a box mediacarve knows after any vendor box.
+
+MP3 has no container. After any ID3v2 tags, Layer III frames are walked while
+each agrees with the first on version, layer and sample rate, then an APEv2 tag
+and an ID3v1 tag are taken in. A frame sync is eleven bits and common in other
+data, so a stream needs 2 frames behind an ID3v2 tag and 4 without one.
 
 CAF records no total size, so its chunks are walked until one is not a type
 Apple's CAF specification defines. Its audio data chunk may give its size as -1,
@@ -150,6 +155,7 @@ dated, path-anchored files.
 | `wav` | WAV (RIFF WAVE) | `.wav` |
 | `aiff` | AIFF and AIFF-C | `.aiff`, `.aifc` |
 | `caf` | Core Audio Format | `.caf` |
+| `mp3` | MPEG audio Layer III, with ID3v2, APEv2 and ID3v1 tags | `.mp3` |
 
 `-k images`, `-k video` and `-k audio` select the groups. The brand is read from
 the `ftyp` box against the [MP4 registration authority's list](https://github.com/mp4ra/mp4ra.github.io/blob/35c6ffec3216d1d0d50671a68509ec4ddbf3c9b5/data/brands.csv).
@@ -321,6 +327,39 @@ the JPEG frame-header rule, the scan header length, the Ns range, the WAV
 `fmt `/`data` walk, the AIFF `COMM` walk, the FORM type in the signature, CAF's
 `desc` first, CAF's listed chunk types, CAF's chunk past the stream, and CAF's
 negative sizes.
+
+**MP3 and false positives.** MP3 is the weakest signature carved: more than half
+the real files start with a bare frame sync, eleven bits that turn up everywhere. 2,229
+files named `.mp3` were taken from public phone images: 868 open with ID3v2, 1,207
+with a bare frame, and 154 are not MP3 at all (ELF binaries, encrypted files, MP4,
+one WAV). The bare-frame threshold was set by carving with it at 1 and reading
+off every threshold from the frame counts of the hits:
+
+| data | MP3 truth | junk hits at 1 frame | at 2 | at 4 |
+| --- | --- | ---: | ---: | ---: |
+| the 4,160 audio and video files above (WAV, AIFF, CAF, Ogg, M4A, MP4, AMR) | none | 4,458 | 0 | 0 |
+| `takeout-exfat` and `takeout-fat32` | file table, 10 MP3 each | 386 | 0 | 0 |
+| `android-root-ext4` | not known | 218,238 | 44 | 0 |
+
+At 4 frames, 1 of the 1,207 untagged files is lost (6 frames would lose 4). Behind
+a tag, 2 frames are required, as FFmpeg's own probe requires, and no real tagged
+file had fewer than 3.
+
+With those settings the 2,075 real MP3s, laid between zeros and again between
+random bytes, came back the same both times: 2,070 at exactly their size, 3 off
+and 2 untagged ones missed. The 154 that are not MP3 gave no MP3 hit. On the two
+Takeout volumes mediacarve returns all 10 MP3s in each file table at exactly
+their size and no other; PhotoRec finds 9. Across the five volumes the only
+change from 0.4.0 is 98 MP3 hits, 96 of which FFmpeg decodes without error. The
+other two are a run of four frames FFmpeg rejects ("big_values too big") and an
+ID3v2 tag with two frames it will not open.
+
+Each MP3 rule was broken in turn and made its own test fail: the 4-frame and
+2-frame thresholds, the agreement on version, layer and rate, the APEv2 and
+ID3v1 tags, and the ID3v2 size bytes and version. Two could not be shown that
+way: allowing free-format frames made the walk loop on zero-length frames, so
+the run never finished, and a Layer I or II stream is measured with the Layer III
+frame formula and falls apart without the layer rule.
 
 ## Tests
 

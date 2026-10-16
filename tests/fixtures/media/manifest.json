@@ -139,6 +139,20 @@
       "ext": ".caf",
       "length": 5394,
       "sha256": "0259c3ad30a03d001ed4b3351b09e142f6af851c12b1f6d19c6fcf0562957c2b"
+    },
+    {
+      "name": "plain.mp3",
+      "kind": "mp3",
+      "ext": ".mp3",
+      "length": 4505,
+      "sha256": "e8df609a7cfecea1344c2e4d89d25c4957eff3f846c362e9462d4492bfb1507c"
+    },
+    {
+      "name": "bare.mp3",
+      "kind": "mp3",
+      "ext": ".mp3",
+      "length": 4412,
+      "sha256": "5b71b32e04d908e99484580b3f5b3c3dce153255d0daf8a5673cce0db1cfeacd"
     }
   ]
 }
