@@ -11,7 +11,7 @@ themselves need nothing but pytest.
     python tools/make_fixtures.py tests/fixtures/media
     python tools/make_fixtures.py tests/fixtures/media --only av
 
-``--only`` writes one group (stills, opencv, av, pcm, mp3, db, plist or zip) and keeps the manifest entries
+``--only`` writes one group (stills, opencv, av, pcm, mp3, db, plist, zip or pdf) and keeps the manifest entries
 of the others, so adding a group does not re-encode the files already committed.
 The av group needs ffmpeg, the opencore-amr and vo-amrwbenc libraries for AMR
 (Homebrew has both), and sips from macOS for HEIC. The pcm group needs ffmpeg and
@@ -72,7 +72,40 @@ def write_media(out_dir, only=None):
         _write_plist(out_dir, record)
     if only in (None, "zip"):
         _write_zip(out_dir, record)
+    if only in (None, "pdf"):
+        _write_pdf(out_dir, record)
     return made
+
+
+def _write_pdf(out_dir, record):
+    """PDFs from Apple's sips and from Pillow, and the sips one again with an
+    incremental update appended by pypdf. Pillow's ends in %%EOF with no line
+    break; the updated one carries two %%EOF markers."""
+    import io
+    from PIL import Image
+    sips = shutil.which("sips")
+    with tempfile.TemporaryDirectory() as tmp:
+        page = os.path.join(tmp, "page.png")
+        Image.new("RGB", (200, 120), (240, 240, 240)).save(page)
+        if sips:
+            _run(sips, "-s", "format", "pdf", page, "--out", os.path.join(out_dir, "sips.pdf"))
+            record("sips.pdf", "pdf")
+            try:
+                from pypdf import PdfWriter
+                writer = PdfWriter(os.path.join(out_dir, "sips.pdf"), incremental=True)
+                writer.add_metadata({"/Title": "fixture update"})
+                with open(os.path.join(out_dir, "updated.pdf"), "wb") as fh:
+                    writer.write(fh)
+                record("updated.pdf", "pdf")
+            except ImportError:
+                print("  pypdf absent: no updated.pdf written", file=sys.stderr)
+        else:
+            print("  sips absent: no sips.pdf written", file=sys.stderr)
+        buf = io.BytesIO()
+        Image.new("RGB", (160, 90), (230, 230, 250)).save(buf, "PDF")
+        with open(os.path.join(out_dir, "pillow.pdf"), "wb") as fh:
+            fh.write(buf.getvalue())
+        record("pillow.pdf", "pdf")
 
 
 def _write_zip(out_dir, record):
@@ -385,7 +418,7 @@ def _write_videos(out_dir, record):
 
 def main(argv):
     only = None
-    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "plist", "zip"):
+    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "plist", "zip", "pdf"):
         only = argv[3]
     elif len(argv) != 2:
         print(__doc__)

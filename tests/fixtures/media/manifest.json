@@ -195,6 +195,27 @@
       "ext": ".zip",
       "length": 1735,
       "sha256": "f02a1d8bff2b6d15e6457aa34ab61e390943dae257ca314d56bbfb518359f53d"
+    },
+    {
+      "name": "sips.pdf",
+      "kind": "pdf",
+      "ext": ".pdf",
+      "length": 5131,
+      "sha256": "b344a1c536338cb97ec1eb3164f1cdb3d0758f623b73ada9e1c829157fdbe063"
+    },
+    {
+      "name": "updated.pdf",
+      "kind": "pdf",
+      "ext": ".pdf",
+      "length": 5615,
+      "sha256": "1c303056320b5b3c1319979a11ff2d673afbffe98a26d3f1c1089f3a50623249"
+    },
+    {
+      "name": "pillow.pdf",
+      "kind": "pdf",
+      "ext": ".pdf",
+      "length": 1728,
+      "sha256": "3d910d6bd4eecd13308afaf1703d3daeab5e76d27518ede2e5c0f89d35ef23b5"
     }
   ]
 }

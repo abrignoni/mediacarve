@@ -37,7 +37,8 @@ sys.path.insert(0, HERE)
 import mediacarve  # noqa: E402  pylint: disable=wrong-import-position
 
 TITLE = "mediacarve"
-KINDS = ("media", "images", "video", "audio", "databases", "plists", "archives", "all")
+KINDS = ("media", "images", "video", "audio", "databases", "plists", "archives",
+         "documents", "all")
 PERCENT = re.compile(r"(\d+(?:\.\d+)?)%")
 
 

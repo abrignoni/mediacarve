@@ -64,11 +64,21 @@ def _image(pieces, size=None, filler=b"\x00", seed=11):
 
 # ------------------------------------------------------------------ recovery
 
+def _outside_media(hits, kind, offset, length):
+    """Hits other than media found inside a fixture of a kind that hides no
+    media: a PDF's page image is still a JPEG."""
+    if kind in mediacarve.MEDIA_KINDS:
+        return hits
+    return [h for h in hits if not (h.kind in mediacarve.MEDIA_KINDS
+                                    and offset <= h.offset and h.end <= offset + length)]
+
+
 @pytest.mark.parametrize("name,meta", _fixtures())
 def test_each_fixture_is_recovered_exactly_on_its_own(name, meta):
     data = _load(name)
     with open(os.path.join(MEDIA, name), "rb") as fh:
         hits = list(mediacarve.carve(fh, kinds=mediacarve.DEFAULT_KINDS | {meta["kind"]}))
+    hits = _outside_media(hits, meta["kind"], 0, meta["length"])
     assert len(hits) == 1, f"{name}: {[(h.kind, h.offset, h.length) for h in hits]}"
     hit = hits[0]
     assert (hit.offset, hit.length, hit.kind, hit.ext) \
@@ -81,6 +91,7 @@ def test_each_fixture_is_recovered_from_inside_a_larger_image(name, meta):
     offset = 8192
     stream = _image([(offset, data)])
     hits = list(mediacarve.carve(stream, kinds=mediacarve.DEFAULT_KINDS | {meta["kind"]}))
+    hits = _outside_media(hits, meta["kind"], offset, meta["length"])
     assert len(hits) == 1, name
     hit = hits[0]
     assert (hit.offset, hit.length) == (offset, meta["length"])
@@ -99,6 +110,8 @@ def test_several_files_in_one_image_all_come_back_byte_for_byte():
         offset += len(data) + rnd.randrange(1000, 9000)
     stream = _image(pieces)
     hits = list(mediacarve.carve(stream, kinds=mediacarve.ALL_KINDS))
+    for off, length, kind, _ in expected:
+        hits = [h for h in hits if h.offset == off or h in _outside_media([h], kind, off, length)]
     assert len(hits) == len(expected)
     for hit, (off, length, kind, sha) in zip(hits, expected):
         assert (hit.offset, hit.length, hit.kind) == (off, length, kind)
@@ -1034,6 +1047,119 @@ def test_the_extension_comes_from_the_entry_names(members, ext):
     archive = _zip(members, stored=True)
     stream = _image([(4096, archive)])
     assert [h.ext for h in mediacarve.carve(stream, kinds={"zip"})] == [ext]
+
+
+
+# ----------------------------------------------------------------------- pdf
+
+def _pdf(objects, *, header=b"%PDF-1.4\n", start=0, update=None, xref_stream=False):
+    """A PDF laid out as ISO 32000-1 7.5 describes, with real offsets. ``start``
+    is where the file will sit in a bigger one, which the offsets ignore."""
+    out = bytearray(header)
+    offsets = []
+    for i, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    if xref_stream:
+        xref_at = len(out)
+        out += b"%d 0 obj\n<< /Type /XRef /Size %d >>\nstream\n\nendstream\nendobj\n" % (
+            len(objects) + 1, len(objects) + 2)
+    else:
+        xref_at = len(out)
+        out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+        out += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+        out += b"trailer\n<< /Size %d /Root 1 0 R >>\n" % (len(objects) + 1)
+    out += b"startxref\n%d\n%%%%EOF\n" % xref_at
+    if update is not None:                        # an incremental update (7.5.6)
+        comment, body = update
+        out += comment
+        at = len(out)
+        out += b"%d 0 obj\n" % (len(objects) + 1) + body + b"\nendobj\n"
+        upd_xref = len(out)
+        out += b"xref\n%d 1\n%010d 00000 n \n" % (len(objects) + 1, at)
+        out += b"trailer\n<< /Size %d /Root 1 0 R /Prev %d >>\n" % (len(objects) + 2, xref_at)
+        out += b"startxref\n%d\n%%%%EOF\n" % upd_xref
+    return bytes(out)
+
+
+_CATALOG = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [] /Count 0 >>"]
+
+
+def test_documents_are_carved_only_when_asked_for():
+    pdf, png = _load("sips.pdf"), _load("plain.png")
+    stream = _image([(4096, pdf), (65536, png)])
+    assert "pdf" not in [h.kind for h in mediacarve.carve(stream)]
+    for kinds in ({"pdf"}, mediacarve._kinds_arg("documents"), mediacarve._kinds_arg("all")):
+        assert ("pdf", len(pdf)) in [(h.kind, h.length) for h in mediacarve.carve(stream, kinds=kinds)]
+
+
+def test_an_update_after_the_first_end_is_part_of_the_file():
+    """7.5.6: an update appends objects, an xref section and a trailer with its
+    own %%EOF. Measured: ExifTool opens its update with a comment line, and a
+    real file came back 3,365 bytes short until comments were allowed."""
+    for comment in (b"", b"%BeginExifToolUpdate\n"):
+        pdf = _pdf(_CATALOG, update=(comment, b"<< /Title (updated) >>"))
+        assert pdf.count(b"%%EOF") == 2
+        stream = _image([(4096, pdf)])
+        assert [(h.offset, h.length) for h in mediacarve.carve(stream, kinds={"pdf"})] == [(4096, len(pdf))]
+
+
+def test_a_dummy_first_page_trailer_is_not_the_end():
+    """Annex F.3.4: a linearized file's first-page trailer may end in
+    "startxref 0" and %%EOF, which are to be ignored."""
+    body = _pdf(_CATALOG)
+    first = b"1000 0 obj\n<< /Linearized 1 >>\nendobj\ntrailer\n<< /Size 3 >>\nstartxref\n0\n%%EOF\n"
+    header = b"%PDF-1.4\n"
+    pdf = header + first + body[len(header):]
+    # move the real startxref by what was inserted
+    real = int(pdf.rsplit(b"startxref\n", 1)[1].split(b"\n")[0])
+    pdf = pdf.rsplit(b"startxref\n", 1)[0] + b"startxref\n%d\n%%%%EOF\n" % (real + len(first))
+    stream = _image([(4096, pdf)])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream, kinds={"pdf"})] == [(4096, len(pdf))]
+
+
+def test_an_eof_marker_that_does_not_point_back_is_skipped():
+    """%%EOF in content, or after a startxref that lands on no cross-reference
+    section counted from this header, is not this file's end."""
+    pdf = _pdf([_CATALOG[0], b"<< /Note (startxref\n12\n%%EOF\n) >>"] + _CATALOG[1:])
+    stream = _image([(4096, pdf)])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream, kinds={"pdf"})] == [(4096, len(pdf))]
+
+
+def test_a_cross_reference_stream_is_a_section_startxref_can_point_to():
+    """7.5.8: from PDF 1.5 startxref may give the offset of a cross-reference
+    stream object rather than the xref keyword."""
+    pdf = _pdf(_CATALOG, header=b"%PDF-1.5\n", xref_stream=True)
+    stream = _image([(4096, pdf)])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream, kinds={"pdf"})] == [(4096, len(pdf))]
+
+
+def test_a_header_needs_its_own_line():
+    """7.5.2: the header is the file's first line. Measured: all 1,294 real PDFs
+    break the line after the version, and two "%PDF-1.4" strings in native
+    libraries on an Android partition did not lead to a PDF."""
+    pdf = _pdf(_CATALOG)
+    joined = pdf.replace(b"%PDF-1.4\n", b"%PDF-1.4 ", 1)
+    stream = _image([(4096, joined)])
+    assert list(mediacarve.carve(stream, kinds={"pdf"})) == []
+
+
+def test_bytes_after_the_end_are_not_the_file():
+    pdf = _pdf(_CATALOG)
+    for tail in (bytes(500), b"garbage that is not a pdf " * 20, b"\r\n" + bytes(100)):
+        stream = io.BytesIO(bytes(4096) + pdf + tail)
+        assert [(h.offset, h.length) for h in mediacarve.carve(stream, kinds={"pdf"})] \
+            == [(4096, len(pdf))], tail[:8]           # its own line break is already in
+
+
+def test_a_pdf_hides_the_pdfs_in_it_but_no_media():
+    inner = _pdf(_CATALOG)
+    jpg = _load("plain.jpg")
+    outer = _pdf([_CATALOG[0], b"<< /Length %d >>\nstream\n" % len(inner) + inner + b"\nendstream",
+                  b"<< /Length %d >>\nstream\n" % len(jpg) + jpg + b"\nendstream", _CATALOG[1]])
+    stream = _image([(4096, outer)])
+    hits = sorted((h.offset, h.kind) for h in mediacarve.carve(stream, kinds=mediacarve.ALL_KINDS))
+    assert hits == [(4096, "pdf"), (4096 + outer.find(jpg), "jpeg")]
 
 
 
