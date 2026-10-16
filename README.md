@@ -70,7 +70,7 @@ mediacarve carve disk.raw -o carved/         # write the files out
 mediacarve carve disk.raw -o carved.zip      # or into a zip
 mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic
 mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, wav, aiff, caf, mp3
-mediacarve carve disk.raw -o out/ -k databases   # sqlite
+mediacarve carve disk.raw -o out/ -k databases   # sqlite, sqlite-encrypted
 mediacarve carve disk.raw -o out/ -k plists  # binary plists
 mediacarve carve disk.raw -o out/ -k archives   # zip, apk, ipa, jar, docx...
 mediacarve carve disk.raw -o out/ -k documents  # pdf
@@ -165,13 +165,15 @@ dated, path-anchored files.
 | `caf` | Core Audio Format | `.caf` |
 | `mp3` | MPEG audio Layer III, with ID3v2, APEv2 and ID3v1 tags | `.mp3` |
 | `sqlite` | SQLite 3 database (asked for with `-k databases` or `-k all`) | `.sqlite` |
+| `sqlite-encrypted` | SQLite 3 database encrypted after a plain 32-byte header, as SQLCipher can write it (asked for with `-k databases` or `-k all`) | `.sqlite` |
 | `bplist` | binary property list, bplist00 (asked for with `-k plists` or `-k all`) | `.plist` |
 | `pdf` | PDF (asked for with `-k documents` or `-k all`) | `.pdf` |
 | `zip` | ZIP and the formats built on it (asked for with `-k archives` or `-k all`) | from the entry names: `.apk`, `.ipa`, `.jar`, `.docx`, `.xlsx`, `.pptx`, `.epub`, `.odt`, `.ods`, `.odp`, otherwise `.zip` |
 
 `-k images`, `-k video` and `-k audio` select the groups. Without `-k`, and with
 `kinds` left out of `carve()`, the media kinds are carved and nothing else, so a
-caller gets what it got before databases were added. `-k databases` adds SQLite,
+caller gets what it got before databases were added. `-k databases` adds SQLite
+and encrypted SQLite,
 `-k plists` adds binary plists, `-k archives` adds ZIP, `-k documents` adds PDF,
 and `-k all` carves everything. A database hides
 nothing found inside it, and nothing hides a database. A plist hides the plists
@@ -389,9 +391,9 @@ fractions, schema format, text encoding and the reserved bytes.
 On 8,700 databases taken by their header from 29 public phone images, laid
 between zeros and again between random bytes, 8,669 came back at exactly their
 size both times. 7 differ, because their page count and file size disagree. 24
-are not reported: 15 have no page count (SQLite before 3.7.0 did not keep it),
-and 9 are encrypted after their first 32 bytes, which the `sqlite3` library will
-not open either. Media inside those databases came out the same, 7,752 hits,
+are not `sqlite` hits: 15 have no page count (SQLite before 3.7.0 did not keep
+it), and 9 are encrypted after their first 32 bytes, which the `sqlite3` library
+will not open either. Those 9 are the `sqlite-encrypted` kind, below. Media inside those databases came out the same, 7,752 hits,
 whether or not databases were asked for.
 
 That run found that a picture stored as a blob, spread over a database's pages,
@@ -427,6 +429,35 @@ version-valid-for check, the page size, the versions, the payload fractions,
 the schema format, the text encoding, the reserved bytes, and the WAL and
 journal page-number rules. A page count of 0 is also refused by the length
 floor, so that rule cannot be shown alone.
+
+**Encrypted SQLite.** SQLCipher can leave the start of page 1 unencrypted, in
+blocks of the cipher's size (`cipher_plaintext_header_size`), and keeps a reserve
+on every page of the IV plus the HMAC, rounded up to the block: 16, 48 or 80 bytes
+with AES-256, 80 with SQLCipher 4's defaults (`sqlcipher.c` at v4.6.1 and v4.17.0,
+`sqlcipher_codec_ctx_set_plaintext_header_size` and
+`sqlcipher_codec_ctx_reserve_setup`). With a 32-byte plain header, the page size
+and the page count can be read, but the version-valid-for number that vouches for
+the count is encrypted. A `sqlite-encrypted` hit is a header whose plain bytes pass
+the same checks as a database's, whose reserve is a non-zero multiple of 16, and
+whose bytes 72 to 91, which SQLite keeps zero, are not zero. Its length is the
+page count as stored. mediacarve does not decrypt it; that needs the database's key.
+
+The 9 such databases among the 8,700 above are all from iOS images and all
+reserve 80 bytes. Between zeros and between random bytes, all 9 come back at
+exactly their size, and no other hit is `sqlite-encrypted`. The 8,676 `sqlite`
+hits are the same as before. The test fixtures are written by the SQLCipher 4.17.0
+shell, with SQLCipher 4's settings and with 3's (48-byte reserve); carved out of
+random bytes, both are byte-identical to what was written, and the SQLCipher shell
+opens them with their key.
+
+On the built volumes, the two made from `jess_ios15` each give one
+`sqlite-encrypted` hit, byte-identical to the one database in that extraction
+encrypted after its header. The other six volumes give none, and on all eight the
+`sqlite` hits are the same, hit for hit, as 0.9.1.
+
+Each rule was broken in turn and made its own test fail: the reserve, the zero
+bytes at 72 to 91 that keep a plain database from being called encrypted, the WAL
+page-number rule, the kind, and the encrypted path itself.
 
 **Binary plists.** A binary plist's length is in its trailer, at its end:
 offsetTableOffset + numObjects x offsetIntSize + 32, with the trailer laid out as
