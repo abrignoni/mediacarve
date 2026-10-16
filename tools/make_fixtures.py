@@ -12,7 +12,7 @@ themselves need nothing but pytest.
     python tools/make_fixtures.py tests/fixtures/media --only av
 
 ``--only`` writes one group (stills, opencv, av, pcm, mp3, db, sqlcipher, plist, zip,
-pdf or tiff) and keeps the manifest entries
+pdf, tiff or bmpico) and keeps the manifest entries
 of the others, so adding a group does not re-encode the files already committed.
 The av group needs ffmpeg, the opencore-amr and vo-amrwbenc libraries for AMR
 (Homebrew has both), and sips from macOS for HEIC. The pcm group needs ffmpeg and
@@ -73,6 +73,8 @@ def write_media(out_dir, only=None):
         _write_mp3(out_dir, record)
     if only in (None, "db"):
         _write_db(out_dir, record)
+    if only in (None, "bmpico"):
+        _write_bmp_ico(out_dir, record)
     if only in (None, "tiff"):
         _write_tiff(out_dir, record)
     if only in (None, "sqlcipher"):
@@ -194,6 +196,29 @@ def _write_db(out_dir, record):
     con.commit()
     con.close()
     record("small.sqlite", "sqlite")
+
+
+def _write_bmp_ico(out_dir, record):
+    """BMP from Pillow (24-bit, and 8-bit with a palette) and from macOS sips
+    (Apple's writer); icons from Pillow, one with PNG images and one with DIBs."""
+    from PIL import Image
+    im = _noisy(Image.new("RGB", (70, 45), (200, 120, 30)), 51, 8)
+    im.save(os.path.join(out_dir, "plain.bmp"), "BMP")
+    record("plain.bmp", "bmp")
+    im.convert("P", palette=Image.Palette.ADAPTIVE, colors=64).save(os.path.join(out_dir, "palette.bmp"), "BMP")
+    record("palette.bmp", "bmp")
+    sips = shutil.which("sips")
+    if sips:
+        _run(sips, "-s", "format", "bmp", os.path.join(out_dir, "plain.png"),
+             "--out", os.path.join(out_dir, "sips.bmp"))
+        record("sips.bmp", "bmp")
+    else:
+        print("  sips absent: no Apple BMP written", file=sys.stderr)
+    icon = _noisy(Image.new("RGBA", (64, 64), (20, 90, 220, 255)), 52, 8)
+    icon.save(os.path.join(out_dir, "png.ico"), "ICO", sizes=[(16, 16), (32, 32), (64, 64)])
+    record("png.ico", "ico")
+    icon.save(os.path.join(out_dir, "dib.ico"), "ICO", sizes=[(16, 16), (32, 32)], bitmap_format="bmp")
+    record("dib.ico", "ico")
 
 
 def _write_tiff(out_dir, record):
@@ -493,7 +518,7 @@ def _write_videos(out_dir, record):
 
 def main(argv):
     only = None
-    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "sqlcipher", "plist", "zip", "pdf", "tiff"):
+    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "sqlcipher", "plist", "zip", "pdf", "tiff", "bmpico"):
         only = argv[3]
     elif len(argv) != 2:
         print(__doc__)

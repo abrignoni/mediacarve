@@ -41,6 +41,7 @@ carving complements a filesystem parser rather than replacing it.
 from __future__ import annotations
 
 import argparse
+import heapq
 import os
 import re
 import struct
@@ -49,7 +50,7 @@ import zipfile
 import zlib
 from typing import NamedTuple
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 # How much to read at a time while scanning, and how much to carry over so a
 # signature straddling two blocks is still found.
@@ -69,6 +70,8 @@ DEFAULT_CAPS = {
     "mp4": 4 << 30,
     "heic": 64 << 20,
     "tiff": 4 << 30,
+    "bmp": 1 << 30,
+    "ico": 16 << 20,
     "m4a": 4 << 30,
     "ogg": 1 << 30,
     "ogv": 4 << 30,
@@ -92,7 +95,7 @@ _ABSOLUTE_CAP = 4 << 30
 # IEND, 57 bytes.
 MIN_LENGTHS = {
     "jpeg": 128, "png": 57, "gif": 64, "webp": 64,
-    "avi": 1024, "mp4": 1024, "heic": 512, "tiff": 64,
+    "avi": 1024, "mp4": 1024, "heic": 512, "tiff": 64, "bmp": 64, "ico": 64,
     "m4a": 1024, "ogg": 128, "ogv": 1024, "amr": 256,
     "wav": 64, "aiff": 64, "caf": 64, "mp3": 128, "sqlite": 512,
     "sqlite-encrypted": 512, "bplist": 41,
@@ -103,14 +106,14 @@ MIN_LENGTHS = {
 # the brand, codec or header they find (see _bmff_ext, _ogg_length, _amr_length).
 EXTENSIONS = {
     "jpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp",
-    "avi": ".avi", "mp4": ".mp4", "heic": ".heic", "tiff": ".tif",
+    "avi": ".avi", "mp4": ".mp4", "heic": ".heic", "tiff": ".tif", "bmp": ".bmp", "ico": ".ico",
     "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "amr": ".amr",
     "wav": ".wav", "aiff": ".aiff", "caf": ".caf", "mp3": ".mp3",
     "sqlite": ".sqlite", "sqlite-encrypted": ".sqlite", "bplist": ".plist", "zip": ".zip",
     "pdf": ".pdf",
 }
 
-IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic", "tiff"})
+IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic", "tiff", "bmp", "ico"})
 VIDEO_KINDS = frozenset({"avi", "mp4", "ogv"})
 AUDIO_KINDS = frozenset({"m4a", "ogg", "amr", "wav", "aiff", "caf", "mp3"})
 MEDIA_KINDS = IMAGE_KINDS | VIDEO_KINDS | AUDIO_KINDS
@@ -122,8 +125,10 @@ ALL_KINDS = MEDIA_KINDS | DATABASE_KINDS | PLIST_KINDS | ARCHIVE_KINDS | DOCUMEN
 
 # What a scan looks for when no kinds are given. Media only, so a caller that
 # has always passed nothing keeps getting what it got before databases were
-# added; databases are asked for by name or with "all".
-DEFAULT_KINDS = MEDIA_KINDS
+# added; databases are asked for by name or with "all". Icons too are asked for
+# ("ico", "images" or "all"): their scan costs more than they return in a
+# default run (_ICO_SCAN).
+DEFAULT_KINDS = MEDIA_KINDS - {"ico"}
 
 
 class Candidate(NamedTuple):
@@ -163,7 +168,18 @@ _SCAN = re.compile(
     b"|%PDF-[12]\\.[0-9][\r\n]"     # PDF header line, version 1.x or 2.x
     b"|ID3[\x02-\x04]\x00"         # ID3v2 tag, versions 2.2 to 2.4
     b"|II\\*\x00|MM\x00\\*"         # TIFF header, little- or big-endian ("*" is 42)
+    b"|BM.{4}\x00{4}.{4}[\x0c\x28\x6c\x7c]\x00{3}"  # BMP: zero reserved words, a DIB header size
     b"|\xff[\xe2\xe3\xf2\xf3\xfa\xfb]",  # MPEG audio Layer III frame sync
+    re.DOTALL)
+
+# An icon or cursor directory: 1 to 255 images, the first entry's reserved byte
+# zero, its size not zero, its image within 4 KiB. It is a pattern of its own,
+# scanned only when icons are asked for: as one more alternative in _SCAN it
+# would be tried at every zero byte, and measured on 128 MiB of an Android ext4
+# volume it took the scan from 0.86 to 2.65 seconds. Alone, starting with a
+# literal, it takes 0.36.
+_ICO_SCAN = re.compile(
+    b"\x00\x00[\x01\x02]\x00[\x01-\xff]\x00...\x00....(?!\x00{3})...\x00.[\x00-\x0f]\x00\x00",
     re.DOTALL)
 
 # Top-level ISO-BMFF box types the carver knows. A file has to show at least one
@@ -535,6 +551,92 @@ def _tiff_length(stream, offset, cap, loose=None):
     if not confirmed and loose is not None:
         loose.add(offset)
     return end, "parsed"
+
+
+# The DIB headers Microsoft documents: BITMAPCOREHEADER (12 bytes),
+# BITMAPINFOHEADER (40), BITMAPV4HEADER (108) and BITMAPV5HEADER (124).
+_BMP_HEADERS = (12, 40, 108, 124)
+_BMP_DEPTHS = (0, 1, 4, 8, 16, 24, 32)
+
+
+def _bmp_length(stream, offset, cap):
+    """A BMP's length is bfSize, "the size, in bytes, of the bitmap file".
+
+    The file header is BITMAPFILEHEADER: "BM", bfSize, two reserved words that
+    "must be zero", and bfOffBits, the offset of the pixels; a DIB header follows
+    (Microsoft, wingdi.h, BITMAPFILEHEADER). The DIB header must be one Microsoft
+    documents, with planes "set to 1" and a bit depth it lists (BITMAPINFOHEADER),
+    the pixels after the headers, and, for uncompressed pixels (BI_RGB and
+    BI_BITFIELDS), room in bfSize for every row at the minimum stride, "the
+    image width in bytes, rounded up to the nearest DWORD".
+
+    Measured on 6 distinct BMPs from public phone images: in all 6, bfSize is
+    exactly the file's size. Five, from Android, record a biSizeImage 2 bytes
+    larger than their rows, so biSizeImage is not used.
+    """
+    head = _read_at(stream, offset, 34)
+    if len(head) < 34:
+        return None
+    size, reserved, pixels, dib = struct.unpack("<IIII", head[2:18])
+    if reserved or dib not in _BMP_HEADERS or not 14 + dib <= pixels < size or size > cap:
+        return None
+    if dib == 12:
+        width, height, planes, depth = struct.unpack("<HHHH", head[18:26])
+        compression = 0
+    else:
+        width, height, planes, depth, compression = struct.unpack("<iiHHI", head[18:34])
+    if planes != 1 or depth not in _BMP_DEPTHS or width <= 0 or not height:
+        return None
+    if compression in (0, 3):                     # BI_RGB, BI_BITFIELDS
+        if not depth:
+            return None
+        stride = ((width * depth + 31) & ~31) >> 3
+        if pixels + stride * abs(height) > size:
+            return None
+    return size, "header"
+
+
+def _ico_length(stream, offset, cap):
+    """An icon or cursor file ends at the end of its furthest image.
+
+    The file opens with ICONDIR: a reserved word "must be 0", the type, 1 for
+    icons (2 for cursors), and the image count, then one 16-byte ICONDIRENTRY per
+    image giving its size and its offset from the start of the file (John
+    Hornick, "Icons", Microsoft, 1995). Each image is a DIB opening with a
+    BITMAPINFOHEADER, or, in icons written since, a PNG. The entry's reserved
+    byte "must be 0"; its planes and bit count are not checked, because in a
+    cursor they hold the hotspot. The first image has to follow the directory:
+    the article does not say so, but every icon measured does, and a 4-byte
+    directory start is common in other data. On one Android ext4 volume the
+    directory start alone matched 107,404 times in its first 512 MiB.
+
+    Measured on 18 distinct icon and cursor files from public phone images: 17
+    end exactly at their furthest image, every image there opening with a
+    40-byte BITMAPINFOHEADER or a PNG signature, and all 18 have their first
+    image right after the directory. The other points at images past its own end
+    and is not reported.
+    """
+    head = _read_at(stream, offset, 6)
+    if len(head) < 6:
+        return None
+    reserved, kind, count = struct.unpack("<HHH", head)
+    if reserved or kind not in (1, 2) or not count:
+        return None
+    table = _read_at(stream, offset + 6, 16 * count)
+    if len(table) < 16 * count:
+        return None
+    end = 6 + 16 * count
+    if struct.unpack("<I", table[12:16])[0] != end:
+        return None                               # the first image follows the directory
+    for i in range(count):
+        entry_reserved, size, at = table[16 * i + 3], *struct.unpack("<II", table[16 * i + 8:16 * i + 16])
+        if entry_reserved or not size or at < 6 + 16 * count or at + size > cap:
+            return None
+        first = _read_at(stream, offset + at, 8)
+        if first != b"\x89PNG\r\n\x1a\n" and first[:4] != b"\x28\x00\x00\x00":
+            return None
+        end = max(end, at + size)
+    return end, "parsed", "ico", ".cur" if kind == 2 else ".ico"
 
 
 def _cap(caps, kind):
@@ -1532,6 +1634,10 @@ def _measure(stream, offset, kind, caps, dead=None, loose=None):
         got = _gif_length(stream, offset, _cap(caps, kind))
     elif kind == "tiff":
         got = _tiff_length(stream, offset, _cap(caps, kind), loose)
+    elif kind == "bmp":
+        got = _bmp_length(stream, offset, _cap(caps, kind))
+    elif kind == "ico":
+        got = _ico_length(stream, offset, _cap(caps, kind))
     elif kind == "riff":
         got = _riff_length(stream, offset, caps)
     elif kind == "bmff":
@@ -1576,7 +1682,7 @@ def _measure(stream, offset, kind, caps, dead=None, loose=None):
 # the stream's end. Measured on one 33.8 MB APK carved for ZIPs only: 89,932
 # MP3 walks and 25 seconds, against a third of a second without them.
 _SIGNATURE_KINDS = {
-    "jpeg": {"jpeg"}, "png": {"png"}, "gif": {"gif"}, "tiff": {"tiff"}, "riff": {"avi", "webp", "wav"},
+    "jpeg": {"jpeg"}, "png": {"png"}, "gif": {"gif"}, "tiff": {"tiff"}, "bmp": {"bmp"}, "ico": {"ico"}, "riff": {"avi", "webp", "wav"},
     "bmff": {"mp4", "heic", "m4a"}, "ogg": {"ogg", "ogv"}, "amr": {"amr"},
     "iff": {"aiff"}, "caf": {"caf"}, "mp3": {"mp3"},
     "sqlite": {"sqlite", "sqlite-encrypted"},
@@ -1650,7 +1756,10 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
         buf = _read_at(stream, pos, min(BLOCK, end - pos))
         if not buf:
             break
-        for match in _SCAN.finditer(buf):
+        matches = _SCAN.finditer(buf)
+        if "ico" in kinds:
+            matches = heapq.merge(matches, _ICO_SCAN.finditer(buf), key=lambda m: m.start())
+        for match in matches:
             sig = match.group()
             at = pos + match.start()
             if sig == b"ftyp":
@@ -1686,6 +1795,10 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                 kind = "jpeg"
             elif sig in (b"II\x2a\x00", b"MM\x00\x2a"):
                 kind = "tiff"
+            elif sig.startswith(b"BM"):
+                kind = "bmp"
+            elif sig.startswith(b"\x00\x00"):
+                kind = "ico"
             elif sig.startswith(b"\x89PNG"):
                 kind = "png"
             else:

@@ -68,7 +68,7 @@ mediacarve list  disk.raw -v                 # one line per file: offset, length
                                              # kind, extension, how it was bounded
 mediacarve carve disk.raw -o carved/         # write the files out
 mediacarve carve disk.raw -o carved.zip      # or into a zip
-mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic, tiff
+mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic, tiff, bmp, ico
 mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, wav, aiff, caf, mp3
 mediacarve carve disk.raw -o out/ -k databases   # sqlite, sqlite-encrypted
 mediacarve carve disk.raw -o out/ -k plists  # binary plists
@@ -157,6 +157,8 @@ dated, path-anchored files.
 | `mp4` | ISO-BMFF video | from the brand: `.mov`, `.3gp`, `.3g2`, `.m4v`, otherwise `.mp4` |
 | `heic` | ISO-BMFF stills | from the brands: `.heic`, `.avif`, otherwise `.heif` |
 | `tiff` | TIFF, little- and big-endian (not BigTIFF) | `.tif` |
+| `bmp` | Windows bitmap (BITMAPFILEHEADER) | `.bmp` |
+| `ico` | Windows icons and cursors (asked for with `-k ico`, `-k images` or `-k all`) | `.ico`, `.cur` |
 | `m4a` | ISO-BMFF with an iTunes audio brand | `.m4a`, `.m4b`, `.m4p` |
 | `ogg` | Ogg audio | from the codec: `.opus`, `.spx`, `.oga` (FLAC), otherwise `.ogg` |
 | `ogv` | Ogg with a Theora stream | `.ogv` |
@@ -188,9 +190,6 @@ from two public Android images were written that way.
 Single-channel AMR only. The multi-channel AMR headers, AMR inside 3GP (that is
 ISO-BMFF, and carves as `mp4`), and SILK voice files (`#!SILK_V3`), which one public
 Android image stores under `com.tencent.mm` with an `.amr` name, are not covered.
-
-BMP is not covered: its signature is two bytes, so it would cost more in false
-positives than it returns.
 
 ## How it was validated
 
@@ -498,6 +497,45 @@ bytes and ExifTool's with 1, which are not carved. Each rule was broken in turn
 and made its own test fail: the IFD chain, the sub-IFD tags, out-of-line values,
 strip extents, the image requirement, tag order, field types, the LZW check, and
 hiding only when confirmed.
+
+**BMP.** A BMP's length is its file header's bfSize, "the size, in bytes, of
+the bitmap file" (Microsoft, BITMAPFILEHEADER). It is taken only with both
+reserved words zero, a DIB header size Microsoft documents (12, 40, 108 or 124),
+the pixels after the headers, planes of 1, a listed bit depth, a width and a
+height, and, for uncompressed pixels, every row at the minimum stride inside
+bfSize (BITMAPINFOHEADER). All 6 distinct BMPs from public phone images come
+back at exactly their size between zeros and between random bytes. None of the
+eight built volumes holds a BMP, and none is reported on them. The fixtures are
+from Pillow (24-bit and 8-bit with a palette) and macOS sips.
+
+**Icons.** An icon or cursor file is a directory, a reserved word of 0, the
+type (1 for icons, 2 for cursors) and a count, then one entry per image with its
+size and offset, and it ends at the end of its furthest image (John Hornick,
+"Icons", Microsoft, 1995). Each image has to open with a 40-byte
+BITMAPINFOHEADER or a PNG signature, each entry's reserved byte has to be 0, and
+the first image has to follow the directory. The article does not require that
+last rule, but all 18 icons measured follow it, and without it a directory's
+first 4 bytes, common in other data, matched 107,404 times in the first 512 MiB
+of one Android volume. 17 of the 18 distinct icon and cursor files from public
+phone images come back at exactly their size; the other points at images past
+its own end and is not reported.
+
+Icons are scanned only when asked for, with `-k ico`, `-k images` or `-k all`.
+Their pattern starts with two zero bytes, and as part of the main scan it took
+128 MiB from 0.86 to 2.65 seconds. Scanned alone it takes 0.36, which would still
+add about a third to every default scan, for a format the census found 36 times
+in 35 public images. An icon hides the PNGs it holds.
+
+On the built volumes `-k images` finds 11 icons on each iOS volume and on
+`macos-apfs`, and 2 on `windows-ntfs`, and all 35 decode in Pillow. They include
+all 13 PhotoRec 7.2 found on those two volumes. PhotoRec also reported 10 icons
+on `android-root-ext4`; none of the 10 decodes in Pillow, and mediacarve
+reports none there. A run without `-k` is the same, hit for hit, as before icons
+and BMP were added, and takes about as long.
+
+Each BMP and icon rule was broken in turn and made its own test fail. The
+reserved words, the DIB header sizes and the icon type are also in the scan
+pattern, so those are shown on the walk itself.
 
 **Binary plists.** A binary plist's length is in its trailer, at its end:
 offsetTableOffset + numObjects x offsetIntSize + 32, with the trailer laid out as

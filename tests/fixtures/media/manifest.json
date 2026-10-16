@@ -274,6 +274,41 @@
       "ext": ".tif",
       "length": 3988,
       "sha256": "a7c152c5fe66ed3291524fa7532b411cb7230c619cb5bd3cdd81fb887ab2d0d2"
+    },
+    {
+      "name": "plain.bmp",
+      "kind": "bmp",
+      "ext": ".bmp",
+      "length": 9594,
+      "sha256": "0a31334d8c22fc4121a6d68204f9f03ee9e9573cd0ab66570374be40da1b19c0"
+    },
+    {
+      "name": "palette.bmp",
+      "kind": "bmp",
+      "ext": ".bmp",
+      "length": 3550,
+      "sha256": "cd98a8f6bb6d52916d142f990714feeca681dfadb2e49ff8f4c5b089c7d1b5c6"
+    },
+    {
+      "name": "sips.bmp",
+      "kind": "bmp",
+      "ext": ".bmp",
+      "length": 32454,
+      "sha256": "90bcaf756269cee7b8540afd1d69d9b4253a083b5ca14c1efa181c0857d51da8"
+    },
+    {
+      "name": "png.ico",
+      "kind": "ico",
+      "ext": ".ico",
+      "length": 7732,
+      "sha256": "618c8518a5815e6a91193d97d67524773860d272f2f35cfe818c56a38377998c"
+    },
+    {
+      "name": "dib.ico",
+      "kind": "ico",
+      "ext": ".ico",
+      "length": 5238,
+      "sha256": "566d9d6784613fc85c842c9fafd8dc9ad158406a91af3059c4d5cd357c8742f3"
     }
   ]
 }
