@@ -41,7 +41,7 @@ def test_cli_reentry_prints_what_the_command_line_prints(image):
     through = run(GUI, "--cli", "list", "-q", "-v", str(image))
     assert direct.returncode == through.returncode == 0
     assert through.stdout == direct.stdout
-    assert f"total         {len(MEDIA)}" in through.stdout
+    assert f"total  {len(MEDIA):>8,}" in through.stdout
 
 
 @pytest.mark.parametrize("name", ["out", "out.zip"])

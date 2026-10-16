@@ -1,13 +1,20 @@
 """Build the small media files the tests carve, and a manifest of known answers.
 
-This is a development tool, not part of mediacarve. It uses Pillow, piexif and
-OpenCV to write real files with real encoders, because a fixture produced by
+This is a development tool, not part of mediacarve. It uses Pillow, piexif,
+OpenCV, FFmpeg, the opencore-amr and vo-amrwbenc encoders and, on macOS, sips to write real files with real
+encoders, because a fixture produced by
 another program is evidence about the format in a way that bytes I hand-assemble
 to match my own parser is not. None of those libraries ships or is imported by
 mediacarve, and the test suite reads only the committed output, so the tests
 themselves need nothing but pytest.
 
     python tools/make_fixtures.py tests/fixtures/media
+    python tools/make_fixtures.py tests/fixtures/media --only av
+
+``--only`` writes one group (stills, opencv or av) and keeps the manifest entries
+of the others, so adding a group does not re-encode the files already committed.
+The av group needs ffmpeg, the opencore-amr and vo-amrwbenc libraries for AMR
+(Homebrew has both), and sips from macOS for HEIC.
 
 One of the JPEGs carries an EXIF thumbnail, which is a whole JPEG inside the
 APP1 segment. That is the case a carver has to get right: the thumbnail must not
@@ -22,7 +29,10 @@ import io
 import json
 import os
 import random
+import shutil
+import subprocess
 import sys
+import tempfile
 
 
 def _noisy(im, seed, fraction=8):
@@ -35,21 +45,32 @@ def _noisy(im, seed, fraction=8):
     return im
 
 
-def write_media(out_dir):
-    from PIL import Image
+def write_media(out_dir, only=None):
     os.makedirs(out_dir, exist_ok=True)
     made = []
 
-    def record(name, kind):
+    def record(name, kind, ext=None):
         path = os.path.join(out_dir, name)
         data = open(path, "rb").read()
-        made.append({"name": name, "kind": kind, "length": len(data),
-                     "sha256": hashlib.sha256(data).hexdigest()})
+        made.append({"name": name, "kind": kind, "ext": ext or os.path.splitext(name)[1],
+                     "length": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+
+    if only in (None, "stills"):
+        _write_stills(out_dir, record)
+    if only in (None, "opencv"):
+        _write_videos(out_dir, record)
+    if only in (None, "av"):
+        _write_av(out_dir, record)
+    return made
+
+
+def _write_stills(out_dir, record):
+    from PIL import Image
 
     # plain JPEG
     _noisy(Image.new("RGB", (160, 120), (200, 40, 40)), 1).save(
         os.path.join(out_dir, "plain.jpg"), "JPEG", quality=85)
-    record("plain.jpg", "jpeg")
+    record("plain.jpg", "jpeg", ".jpg")
 
     # JPEG carrying an EXIF thumbnail: a whole JPEG inside APP1
     big = _noisy(Image.new("RGB", (320, 240), (30, 90, 200)), 2)
@@ -64,7 +85,7 @@ def write_media(out_dir):
         piexif.insert(piexif.dump(exif), os.path.join(out_dir, "thumbed.jpg"))
     except ImportError:
         print("  piexif absent: thumbed.jpg carries no EXIF thumbnail", file=sys.stderr)
-    record("thumbed.jpg", "jpeg")
+    record("thumbed.jpg", "jpeg", ".jpg")
 
     _noisy(Image.new("RGB", (120, 90), (40, 160, 60)), 4, 16).save(
         os.path.join(out_dir, "plain.png"), "PNG")
@@ -80,8 +101,124 @@ def write_media(out_dir):
         os.path.join(out_dir, "plain.webp"), "WEBP")
     record("plain.webp", "webp")
 
-    _write_videos(out_dir, record)
-    return made
+
+def _run(*cmd):
+    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def _load_lib(name):
+    import ctypes
+    import ctypes.util
+    found = ctypes.util.find_library(name)
+    for candidate in filter(None, (found, f"/opt/homebrew/lib/lib{name}.dylib",
+                                   f"/usr/local/lib/lib{name}.dylib", f"lib{name}.so")):
+        try:
+            return ctypes.CDLL(candidate)
+        except OSError:
+            continue
+    raise OSError(f"lib{name} not found (Homebrew: opencore-amr, vo-amrwbenc)")
+
+
+def _amr_nb(pcm):
+    """Encode with opencore-amr's AMR-NB encoder, which writes storage frames."""
+    import ctypes
+    lib = _load_lib("opencore-amrnb")
+    lib.Encoder_Interface_init.restype = ctypes.c_void_p
+    lib.Encoder_Interface_Encode.argtypes = (ctypes.c_void_p, ctypes.c_int,
+                                             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int)
+    state = lib.Encoder_Interface_init(1)                 # discontinuous transmission on
+    out, frame = bytearray(), ctypes.create_string_buffer(64)
+    for i in range(0, len(pcm) - 319, 320):               # 160 samples, 20 ms
+        n = lib.Encoder_Interface_Encode(state, 7, pcm[i:i + 320], frame, 0)   # 12.2 kbps
+        out += frame.raw[:n]
+    lib.Encoder_Interface_exit(ctypes.c_void_p(state))
+    return bytes(out)
+
+
+def _amr_wb(pcm):
+    """Encode with VisualOn's AMR-WB encoder, which writes storage frames."""
+    import ctypes
+    lib = _load_lib("vo-amrwbenc")
+    lib.E_IF_init.restype = ctypes.c_void_p
+    lib.E_IF_encode.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                                ctypes.c_char_p, ctypes.c_int)
+    state = lib.E_IF_init()
+    out, frame = bytearray(), ctypes.create_string_buffer(64)
+    for i in range(0, len(pcm) - 639, 640):               # 320 samples, 20 ms
+        n = lib.E_IF_encode(state, 2, pcm[i:i + 640], frame, 1)               # 12.65 kbps, DTX
+        out += frame.raw[:n]
+    lib.E_IF_exit(ctypes.c_void_p(state))
+    return bytes(out)
+
+
+def _write_av(out_dir, record):
+    """Audio, and video in the ISO-BMFF brands other than mp4, from real encoders.
+
+    Each file is labelled by its container's own brand, codec or header, so the
+    name, kind and extension recorded here are what the carver must report.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print("  ffmpeg absent: no av fixtures written", file=sys.stderr)
+        return
+    ff = (ffmpeg, "-hide_banner", "-y")
+    tone = ("-f", "lavfi", "-i", "sine=frequency=440:duration=1")
+    noise = ("-f", "lavfi", "-i", "anoisesrc=duration=1:seed=7")
+    picture = ("-f", "lavfi", "-i", "testsrc=size=128x96:rate=10:duration=1")
+
+    def path(name):
+        return os.path.join(out_dir, name)
+
+    def dest(name):                           # output options, then the file
+        return ("-bitexact", "-map_metadata", "-1", path(name))
+
+    _run(*ff, *picture, "-c:v", "mpeg4", "-f", "mov", *dest("plain.mov"))
+    record("plain.mov", "mp4")
+    _run(*ff, *picture, *tone, "-c:v", "h263", "-c:a", "aac", "-ac", "1", "-ar", "8000",
+         "-f", "3gp", *dest("plain.3gp"))
+    record("plain.3gp", "mp4")
+    _run(*ff, *noise, "-c:a", "aac", "-b:a", "32k", "-f", "ipod", *dest("plain.m4a"))
+    record("plain.m4a", "m4a")
+    _run(*ff, *noise, "-c:a", "libopus", "-b:a", "24k", "-f", "ogg", *dest("plain.opus"))
+    record("plain.opus", "ogg")
+    _run(*ff, *noise, "-c:a", "vorbis", "-strict", "-2", "-ac", "2", "-f", "ogg",
+         *dest("plain.ogg"))
+    record("plain.ogg", "ogg")
+
+    sips = shutil.which("sips")
+    for name, rate, magic, encode in (("plain.amr", 8000, b"#!AMR\n", _amr_nb),
+                                      ("plain.awb", 16000, b"#!AMR-WB\n", _amr_wb)):
+        # a second of noise, then half a second of silence, so the encoder's
+        # discontinuous transmission writes SID and NO_DATA frames as well
+        pcm = subprocess.run((*ff, *noise, "-af", "apad=pad_dur=0.5", "-ac", "1",
+                              "-ar", str(rate), "-f", "s16le", "-"),
+                             check=True, capture_output=True, stdin=subprocess.DEVNULL).stdout
+        try:
+            frames = encode(pcm)
+        except OSError as exc:
+            print(f"  no {name} written: {exc}", file=sys.stderr)
+            continue
+        with open(path(name), "wb") as out:
+            out.write(magic + frames)
+        record(name, "amr")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        if sips:
+            png = os.path.join(tmp, "still.png")
+            _run(*ff, "-f", "lavfi", "-i", "testsrc=size=160x120", "-frames:v", "1", png)
+            _run(sips, "-s", "format", "heic", png, "--out", path("plain.heic"))
+            record("plain.heic", "heic")
+        else:
+            print("  sips absent: no HEIC fixture written", file=sys.stderr)
+
+    try:
+        from PIL import Image
+        _noisy(Image.new("RGB", (96, 72), (90, 30, 150)), 8, 16).save(
+            path("plain.avif"), "AVIF")
+        record("plain.avif", "heic")
+    except (ImportError, KeyError, OSError) as exc:
+        print(f"  no AVIF fixture written: {exc}", file=sys.stderr)
 
 
 def _write_videos(out_dir, record):
@@ -109,11 +246,21 @@ def _write_videos(out_dir, record):
 
 
 def main(argv):
-    if len(argv) != 2:
+    only = None
+    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av"):
+        only = argv[3]
+    elif len(argv) != 2:
         print(__doc__)
         return 2
     out = os.path.abspath(argv[1])
-    made = write_media(out)
+    made = write_media(out, only)
+    if only:
+        names = {m["name"] for m in made}
+        with open(os.path.join(out, "manifest.json"), encoding="utf-8") as fh:
+            kept = [m for m in json.load(fh)["media"] if m["name"] not in names]
+        for m in kept:                        # manifests before 0.3.0 had no ext
+            m.setdefault("ext", os.path.splitext(m["name"])[1])
+        made = kept + made
     manifest = {"media": made}
     with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)

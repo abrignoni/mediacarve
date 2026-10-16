@@ -1,6 +1,6 @@
 # mediacarve
 
-Recover images and video from any stream of bytes, by signature. One file, pure
+Recover images, video and audio from any stream of bytes, by signature. One file, pure
 Python, standard library only. No compiler, no network, nothing to install.
 
 ```python
@@ -66,6 +66,7 @@ mediacarve list  disk.raw -v                 # one line per file
 mediacarve carve disk.raw -o carved/         # write the files out
 mediacarve carve disk.raw -o carved.zip      # or into a zip
 mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic
+mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr
 ```
 
 ## Lengths are parsed, not guessed
@@ -82,8 +83,24 @@ length was arrived at:
 JPEG walks its markers rather than searching for the end-of-image marker, which
 matters because an EXIF thumbnail is a whole JPEG inside the APP1 segment: the
 segment's own length steps over it, so the thumbnail neither truncates the file
-nor gets reported as a second one. PNG sums chunks to IEND, GIF walks blocks to
-the trailer, and RIFF and ISO-BMFF read their own recorded sizes.
+nor gets reported as a second one. PNG sums chunks to IEND and checks the CRC of
+every critical chunk, GIF walks blocks to the trailer, and RIFF and ISO-BMFF read
+their own recorded sizes once the file opens with the chunk or box its format
+requires: `LIST hdrl` for AVI, a VP8 chunk for WebP, and a box mediacarve knows
+after any vendor box.
+
+Ogg walks its pages and checks each one's CRC, the page sequence of each stream,
+and the end-of-stream flag. Not every writer sets that flag, so a file ends at the
+last page that checks, and every byte reported has passed a CRC as part of the
+file. A file damaged or overwritten part way comes back as the part before the
+damage.
+
+AMR records no length and has no terminator, so its frames are walked until a
+byte cannot be a frame header (RFC 4867, section 5.3) or a frame is all zeros.
+Bytes after the file can happen to parse as a few more frames, and a file whose
+last frame is cut short takes the bytes that complete it. Laid into random bytes,
+448 of 500 copies of the AMR fixture came back exactly and the longest ran 47
+bytes over.
 
 A recorded size is only what the bytes say, so three limits apply and a hit cut
 at one is reported as `capped`:
@@ -96,7 +113,8 @@ at one is reported as `capped`:
   file's to claim. Without it a file that starts inside the range ends where its
   own structure says, and hits from two ranges can overlap.
 
-Files found inside another file are suppressed by default and reported with
+A hit cut at a limit hides nothing, because its length is not known. Files found
+inside another file are suppressed by default and reported with
 `nested=True`. On an MJPG AVI that is the difference between one video and the
 twelve JPEG frames inside it.
 
@@ -112,10 +130,31 @@ replacing it: carving is the floor that still works on a filesystem nobody has
 written a parser for, and a parser is what turns anonymous blobs into named,
 dated, path-anchored files.
 
-Formats covered are JPEG, PNG, GIF, WebP, AVI, ISO-BMFF video (MP4, MOV, 3GP)
-and ISO-BMFF stills (HEIC, HEIF, AVIF). BMP and TIFF are not covered: BMP's
-signature is two bytes and TIFF's length is not in its header, so both would cost
-more in false positives than they return.
+## Kinds and extensions
+
+| kind | formats | extension |
+| --- | --- | --- |
+| `jpeg`, `png`, `gif`, `webp` | the format of that name | `.jpg`, `.png`, `.gif`, `.webp` |
+| `avi` | AVI | `.avi` |
+| `mp4` | ISO-BMFF video | from the brand: `.mov`, `.3gp`, `.3g2`, `.m4v`, otherwise `.mp4` |
+| `heic` | ISO-BMFF stills | from the brands: `.heic`, `.avif`, otherwise `.heif` |
+| `m4a` | ISO-BMFF with an iTunes audio brand | `.m4a`, `.m4b`, `.m4p` |
+| `ogg` | Ogg audio | from the codec: `.opus`, `.spx`, `.oga` (FLAC), otherwise `.ogg` |
+| `ogv` | Ogg with a Theora stream | `.ogv` |
+| `amr` | AMR and AMR-WB storage files | `.amr`, `.awb` |
+
+`-k images`, `-k video` and `-k audio` select the groups. The brand is read from
+the `ftyp` box against the [MP4 registration authority's list](https://github.com/mp4ra/mp4ra.github.io/blob/35c6ffec3216d1d0d50671a68509ec4ddbf3c9b5/data/brands.csv).
+A brand only says what the writer declared: an audio-only file written with the
+generic `mp42` brand is reported as `mp4`, and 29 of 59 distinct `.m4a` files
+from two public Android images were written that way.
+
+Single-channel AMR only. The multi-channel AMR headers, AMR inside 3GP (that is
+ISO-BMFF, and carves as `mp4`), and SILK voice files (`#!SILK_V3`), which one public
+Android image stores under `com.tencent.mm` with an `.amr` name, are not covered.
+
+BMP and TIFF are not covered: BMP's signature is two bytes and TIFF's length is
+not in its header, so both would cost more in false positives than they return.
 
 ## How it was validated
 
@@ -161,6 +200,87 @@ volume where the scan reports 8 MP4 files: 4 came back short by exactly their
 259 hits on that volume, and all 2,861 on two more test volumes, were the same
 in both.
 
+**Audio from real devices.** 260 distinct audio and video files taken from five
+public images (`pixel3_a11`, `hickman_a13`, `galaxys10_a10`, `kevin_pocox7_a15`,
+`ctf2020_ios12`) were laid into an 8.4 MiB image between runs of zeros, and again
+between runs of random bytes. ffprobe named each file's format first. In zeros,
+251 of the 252 that are formats mediacarve covers came back at their offset with
+a matching SHA-256 and the expected kind and extension: 179 Ogg Opus, 1 Ogg
+Vorbis, 30 M4A, 33 MP4, 1 3GP and 7 of 8 AMR. The eighth AMR came back one byte
+long: its last frame is a 32-byte frame with 31 bytes in the file, and the byte
+after it completes it. The
+8 SILK files gave no hit. In random bytes the same 244 that are not AMR came back
+exactly, and 6 of the 8 AMR; the other two ran 1 and 6 bytes long. Neither image
+gave a hit anywhere else.
+
+Two defects were found that way, and both are pinned as tests. Requiring an
+end-of-stream page missed 9 of the 27 distinct Ogg Opus files from `hickman_a13`,
+which end cleanly without one. And in random bytes, one MP4 ran 3.97 MB past its
+end: the four printable bytes `sIs}` after it passed for a vendor box declaring
+4,265,331,032 bytes, and the extent hid 106 of the files above. 0.2.0 reports the
+same extent. A vendor box now has to be followed by a box mediacarve knows, or by
+the end of the stream.
+
+**Against PhotoRec.** PhotoRec 7.2 was run as a second carver on five constructed
+volumes in the corpus (`takeout-exfat`, `takeout-fat32`, `windows-ntfs`,
+`macos-apfs` and `android-root-ext4` from the raw image fixtures), and hits were
+matched by offset. On the two Takeout volumes the file table gives every file's
+size: in all 42 files where the two carvers' lengths differ, mediacarve's is the
+file's size.
+
+The comparison found five ways a false extent hid real files, each pinned as a
+test. Every number is a file that PhotoRec recovered and that decodes:
+
+- an `mdat` declaring 4.5 x 10^18 bytes, cut at the 4 GiB ceiling, hid 1,733 on
+  `android-root-ext4`. A capped hit now hides nothing.
+- `RIFF`, a size and `AVI ` followed by timezone abbreviations, read as a 774 MB
+  AVI, hid 455 there. An AVI now has to open with `LIST hdrl`, and a WebP with a
+  VP8 chunk.
+- four spaces read as a vendor box after a real `uuid` box hid 179 on
+  `macos-apfs`, because the text after them had the shape of a box header.
+- PNGs whose IEND declared 150,994,944 and 589,824 bytes hid 14 on
+  `windows-ntfs`. IEND now has to be empty, and critical chunks pass their CRC.
+- 38 PNGs of 68 to 127 bytes were under the 128-byte floor. With the CRCs checked
+  the floor is the smallest valid PNG, 57 bytes.
+
+Afterwards PhotoRec recovered 4 media files that mediacarve does not report,
+none of which decodes cleanly: a 19,571-byte piece of a 3.5 MB JPEG whose APP1
+length is one byte off, which mediacarve rejects, and three MP4 or Ogg files
+FFmpeg reports errors in. It also recovered 32 MP3, 23 ICO, 7 SVG and 1 MPEG-TS,
+formats mediacarve does not carve. mediacarve reports thousands of files PhotoRec
+does not, nearly all inside other files: PhotoRec looks for a header only where
+a block starts.
+
+**Against 0.2.0.** On the same five volumes: the two Takeout volumes are
+unchanged. On `android-root-ext4`, 0.2.0's 2,556 hits become 10,443: the false
+AVI is gone, 7,888 hits are new and 7,882 of them decode, 21 stills are now
+`.avif` and one `mp4` is now `m4a`. On `macos-apfs`, 9,777 become 15,219. 0.2.0
+reported an MP4 at 1.86 GB, cut at the end of the image, because a 2.6 GB vendor
+"box" `dlm(` followed it; it is now 213,936 bytes, the sum of its `ftyp`, `moov`,
+`free` and `mdat`. 5,442 hits are new, and 5,356 of the 5,375 stills among them
+decode; the 67 MP4s are like the 82 0.2.0 found there, most of which FFmpeg
+reports errors in. On `windows-ntfs`, 2,857 become 3,039: 181 PNGs with a failing
+critical CRC are gone, 156 of which neither Pillow nor FFmpeg decodes; 334 PNGs
+are new, 328 of which one of them does; and 29 Ogg Vorbis files are new.
+
+**PNG on known data.** Up to 1,500 PNGs were sampled from each of 29 public phone
+images. Of the 38,585 that 0.2.0 returns at exactly their file size, this walk
+returns 38,583 the same way. The other two fail their IDAT CRC and do not decode.
+
+**Controls.** For the audio kinds, each of these was broken in turn and made its
+own test fail: the Ogg CRC check, the page sequence check, the rule that first
+pages come before any other, taking a first page cut off by the end of the stream
+on trust, ignoring that cut, the AMR padding bits, the AMR frame types a storage
+file may carry, the all-zero frame rule, the AMR length floor, the brand to
+extension mapping, reading the compatible brands, and the rule that a vendor box
+is followed by a box mediacarve knows. Ending the walk at the end-of-stream page
+is not one of them: whatever follows that page ends the walk at the same byte
+anyway. The same was done for the false-extent fixes: capped hits hiding others,
+the AVI `hdrl` rule, the WebP first chunk, the AVI first chunk fitting its RIFF,
+the PNG CRC check, checking only IHDR and IEND instead of every critical chunk,
+checking every chunk instead, the empty IEND, the IDAT requirement, IHDR first,
+CgBI ahead of IHDR, the PNG ceiling, and the old 128-byte floor.
+
 ## Tests
 
 ```
@@ -173,8 +293,10 @@ The media fixtures are regenerated with:
 python tools/make_fixtures.py tests/fixtures/media
 ```
 
-That tool uses Pillow, piexif and OpenCV and is for development only. None of
-them ships or is imported by `mediacarve`, and the test suite reads only the
+That tool uses Pillow, piexif, OpenCV, FFmpeg, the opencore-amr and vo-amrwbenc
+encoders, and on macOS `sips`, and is for development only. `--only av` writes the
+audio and other video fixtures alone and keeps the rest. None of them ships or is
+imported by `mediacarve`, and the test suite reads only the
 committed output, so running the tests needs nothing but pytest.
 
 ## License
