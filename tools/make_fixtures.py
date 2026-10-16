@@ -11,7 +11,7 @@ themselves need nothing but pytest.
     python tools/make_fixtures.py tests/fixtures/media
     python tools/make_fixtures.py tests/fixtures/media --only av
 
-``--only`` writes one group (stills, opencv, av, pcm, mp3 or db) and keeps the manifest entries
+``--only`` writes one group (stills, opencv, av, pcm, mp3, db or plist) and keeps the manifest entries
 of the others, so adding a group does not re-encode the files already committed.
 The av group needs ffmpeg, the opencore-amr and vo-amrwbenc libraries for AMR
 (Homebrew has both), and sips from macOS for HEIC. The pcm group needs ffmpeg and
@@ -68,7 +68,27 @@ def write_media(out_dir, only=None):
         _write_mp3(out_dir, record)
     if only in (None, "db"):
         _write_db(out_dir, record)
+    if only in (None, "plist"):
+        _write_plist(out_dir, record)
     return made
+
+
+def _write_plist(out_dir, record):
+    """A binary plist written by Apple's plutil from an XML plist."""
+    import plistlib
+    plutil = shutil.which("plutil")
+    if not plutil:
+        print("  plutil absent: no plist fixture written", file=sys.stderr)
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        xml = os.path.join(tmp, "small.xml")
+        rnd = random.Random(23)
+        with open(xml, "wb") as fh:
+            plistlib.dump({"name": "fixture", "count": 300,
+                           "values": [rnd.randrange(1 << 20) for _ in range(300)],
+                           "nested": {"flag": True, "when": "2026-10-16", "data": bytes(range(256))}}, fh)
+        _run(plutil, "-convert", "binary1", "-o", os.path.join(out_dir, "small.plist"), xml)
+    record("small.plist", "bplist")
 
 
 def _write_db(out_dir, record):
@@ -320,7 +340,7 @@ def _write_videos(out_dir, record):
 
 def main(argv):
     only = None
-    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db"):
+    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "plist"):
         only = argv[3]
     elif len(argv) != 2:
         print(__doc__)

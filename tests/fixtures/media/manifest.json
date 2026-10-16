@@ -160,6 +160,13 @@
       "ext": ".sqlite",
       "length": 8192,
       "sha256": "103c4db5472ec089d61823c8167e7f27d7710f9b53e2aa2f8acb2b14dcb5f942"
+    },
+    {
+      "name": "small.plist",
+      "kind": "bplist",
+      "ext": ".plist",
+      "length": 3087,
+      "sha256": "d71876679aae108dbf72e6f2e178c708b9cd61430704bf7a5491f10acc2e2b9f"
     }
   ]
 }

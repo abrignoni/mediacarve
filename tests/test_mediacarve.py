@@ -723,6 +723,111 @@ def test_page_one_copied_into_a_log_is_not_a_database():
 
 
 
+# -------------------------------------------------------------------- bplist
+
+def _plist():
+    return _load("small.plist")
+
+
+def _set_trailer(data, **fields):
+    """Rewrite fields of a binary plist's 32-byte trailer."""
+    data = bytearray(data)
+    t = len(data) - 32
+    if "ois" in fields:
+        data[t + 6] = fields["ois"]
+    if "ors" in fields:
+        data[t + 7] = fields["ors"]
+    for name, at in (("count", 8), ("top", 16), ("table", 24)):
+        if name in fields:
+            data[t + at:t + at + 8] = struct.pack(">Q", fields[name])
+    return bytes(data)
+
+
+def _trailer(data):
+    ois, ors = data[-26], data[-25]
+    count, top, table = struct.unpack(">QQQ", data[-24:])
+    return ois, ors, count, top, table
+
+
+def test_plists_are_carved_only_when_asked_for():
+    plist, png = _plist(), _load("plain.png")
+    stream = _image([(4096, plist), (65536, png)])
+    assert [h.kind for h in mediacarve.carve(stream)] == ["png"]
+    for kinds in ({"bplist"}, mediacarve._kinds_arg("plists"), mediacarve._kinds_arg("all")):
+        assert ("bplist", len(plist)) in [(h.kind, h.length) for h in mediacarve.carve(stream, kinds=kinds)]
+
+
+def test_the_trailer_found_is_the_one_that_points_back_to_this_header():
+    """A plist stored inside another one ends first, with a trailer of its own;
+    only a trailer whose offset table ends where it begins, counted from this
+    header, is this plist's. The inner one is hidden, as a nested file is."""
+    import plistlib
+    inner = _plist()
+    outer = plistlib.dumps({"before": "x" * 50, "archived": inner, "after": list(range(40))},
+                           fmt=plistlib.FMT_BINARY)
+    at = outer.find(inner)
+    assert at > 0
+    stream = _image([(4096, outer)])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream, kinds={"bplist"})] == [(4096, len(outer))]
+    assert (4096 + at, len(inner)) in [(h.offset, h.length) for h in
+                                       mediacarve.carve(stream, kinds={"bplist"}, nested=True)]
+
+
+def test_a_decoy_trailer_that_does_not_point_back_is_skipped():
+    """Bytes inside the plist shaped like a trailer, whose offset table even reads
+    as valid from this header, are not this plist's trailer unless that table
+    ends exactly where they begin."""
+    import plistlib
+    decoy = b"\x00" * 6 + b"\x01\x01" + struct.pack(">QQQ", 1, 0, 0) + b"\x08"
+    outer = bytearray(plistlib.dumps({"a": decoy, "b": list(range(60))}, fmt=plistlib.FMT_BINARY))
+    at = outer.find(decoy)
+    eight = at + 32                               # the 0x08 byte after the decoy
+    outer[at + 24:at + 32] = struct.pack(">Q", eight)   # its table: one 1-byte offset, 8
+    assert plistlib.loads(bytes(outer))["a"][:6] == bytes(6)
+    stream = _image([(4096, bytes(outer))])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream, kinds={"bplist"})] \
+        == [(4096, len(outer))]
+
+
+def test_a_plist_hides_no_media():
+    """Asking for plists changes no media hit."""
+    import plistlib
+    png = _load("plain.png")
+    plist = plistlib.dumps({"picture": png, "name": "with a picture"}, fmt=plistlib.FMT_BINARY)
+    stream = _image([(4096, plist)])
+    at = plist.find(png)
+    assert sorted((h.offset, h.kind) for h in mediacarve.carve(stream, kinds=mediacarve.ALL_KINDS)) \
+        == [(4096, "bplist"), (4096 + at, "png")]
+
+
+def test_a_header_with_no_trailer_is_not_a_plist():
+    rnd = random.Random(31)
+    for tail in (rnd.randbytes(1 << 20), bytes(1 << 20), _prose(1 << 20)):
+        stream = io.BytesIO(bytes(4096) + b"bplist00" + tail)
+        assert list(mediacarve.carve(stream, kinds={"bplist"})) == []
+
+
+def test_a_trailer_apple_would_refuse_is_not_a_plist():
+    """__CFBinaryPlistGetTopLevelInfo (CFBinaryPList.c, CF-1153.18): the top
+    object is one of the objects, and object references are wide enough to
+    name every object. Neither change moves where the trailer has to be, so
+    only these checks can refuse them."""
+    plist = _plist()
+    ois, ors, count, top, table = _trailer(plist)
+    assert count >= 256 and ors >= 2
+    for bad, why in ((_set_trailer(plist, top=count), "top object not among the objects"),
+                     (_set_trailer(plist, ors=1), "1-byte references cannot name every object")):
+        assert list(mediacarve.carve(_image([(4096, bad)]), kinds={"bplist"})) == [], why
+
+
+def test_an_offset_outside_the_object_data_is_not_a_plist():
+    plist = bytearray(_plist())
+    ois, ors, count, top, table = _trailer(bytes(plist))
+    plist[table:table + ois] = (table + 5).to_bytes(ois, "big")   # first offset past the data
+    assert list(mediacarve.carve(_image([(4096, bytes(plist))]), kinds={"bplist"})) == []
+
+
+
 # ----------------------------------------------------------------------- ogg
 
 def _crc_reference(data):

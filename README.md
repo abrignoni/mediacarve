@@ -1,7 +1,7 @@
 # mediacarve
 
-Recover images, video, audio and, when asked, SQLite databases from any stream of
-bytes, by signature. One file, pure
+Recover images, video, audio and, when asked, SQLite databases and binary plists
+from any stream of bytes, by signature. One file, pure
 Python, standard library only. No compiler, no network, nothing to install.
 
 ```python
@@ -69,7 +69,8 @@ mediacarve carve disk.raw -o carved.zip      # or into a zip
 mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic
 mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, wav, aiff, caf, mp3
 mediacarve carve disk.raw -o out/ -k databases   # sqlite
-mediacarve carve disk.raw -o out/ -k all     # media and databases
+mediacarve carve disk.raw -o out/ -k plists  # binary plists
+mediacarve carve disk.raw -o out/ -k all     # media, databases and plists
 ```
 
 ## Lengths are parsed, not guessed
@@ -160,12 +161,14 @@ dated, path-anchored files.
 | `caf` | Core Audio Format | `.caf` |
 | `mp3` | MPEG audio Layer III, with ID3v2, APEv2 and ID3v1 tags | `.mp3` |
 | `sqlite` | SQLite 3 database (asked for with `-k databases` or `-k all`) | `.sqlite` |
+| `bplist` | binary property list, bplist00 (asked for with `-k plists` or `-k all`) | `.plist` |
 
 `-k images`, `-k video` and `-k audio` select the groups. Without `-k`, and with
 `kinds` left out of `carve()`, the media kinds are carved and nothing else, so a
-caller gets what it got before databases were added. `-k databases` adds SQLite
-and `-k all` carves both. A database hides nothing found inside it, and nothing
-hides a database. The brand is read from
+caller gets what it got before databases were added. `-k databases` adds SQLite,
+`-k plists` adds binary plists, and `-k all` carves everything. A database hides
+nothing found inside it, and nothing hides a database. A plist hides the plists
+stored in it but no media, so asking for plists changes no media hit. The brand is read from
 the `ftyp` box against the [MP4 registration authority's list](https://github.com/mp4ra/mp4ra.github.io/blob/35c6ffec3216d1d0d50671a68509ec4ddbf3c9b5/data/brands.csv).
 A brand only says what the writer declared: an audio-only file written with the
 generic `mp42` brand is reported as `mp4`, and 29 of 59 distinct `.m4a` files
@@ -416,6 +419,38 @@ version-valid-for check, the page size, the versions, the payload fractions,
 the schema format, the text encoding, the reserved bytes, and the WAL and
 journal page-number rules. A page count of 0 is also refused by the length
 floor, so that rule cannot be shown alone.
+
+**Binary plists.** A binary plist's length is in its trailer, at its end:
+offsetTableOffset + numObjects x offsetIntSize + 32, with the trailer laid out as
+CFBinaryPlistTrailer (ForFoundationOnly.h) and checked as Apple's own reader
+checks it (__CFBinaryPlistGetTopLevelInfo, CFBinaryPList.c, CF-1153.18). From the
+header the walk searches forward, up to 32 MiB, for a trailer whose offset table
+ends exactly where it begins, counted from that header, and whose offsets all
+point into the object data. A header with no such trailer costs about half a
+second to rule out, the time to read 32 MiB.
+
+On 4,818 binary plists from public phone images, laid between zeros and again
+between random bytes, all 4,818 came back at exactly their size both times, and
+in every one the trailer's length was the file's size. On `takeout-exfat`,
+`windows-ntfs`, `macos-apfs` and `android-root-ext4` every `bplist0` header in
+the image was counted, and every one is reported: 2, none, 46 and none. With
+`takeout-fat32` (2) and `android-userdata-ext4` (none), every plist hit reads in
+Python's `plistlib` and passes Apple's `plutil -lint`. On the five volumes a run
+without `-k` is the same, hit for hit, as 0.6.0, and on all six asking for
+plists changes no media hit.
+
+PhotoRec 7.2 does carve binary plists, but to whole sectors: on a control image
+it returned 6,656 bytes for a 6,344-byte plist, and its 5 plists on `macos-apfs`
+are 512 bytes each, which `plistlib` will not read because Apple's format puts
+the trailer at the very end. mediacarve returns those 5, and 41 more, at lengths
+`plistlib` reads.
+
+Each plist rule was broken in turn and made its own test fail: media only by
+default, the trailer pointing back to its header, the top object, the reference
+width, the offsets inside the object data, a plist hiding no media, and a plist
+hiding the plists stored in it. The offset-width check and the lower bounds on
+the object count and table offset could not be shown alone, because the
+pointing-back and offset checks refuse the same trailers first.
 
 ## Tests
 
