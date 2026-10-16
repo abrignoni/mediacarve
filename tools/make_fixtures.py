@@ -11,10 +11,11 @@ themselves need nothing but pytest.
     python tools/make_fixtures.py tests/fixtures/media
     python tools/make_fixtures.py tests/fixtures/media --only av
 
-``--only`` writes one group (stills, opencv or av) and keeps the manifest entries
+``--only`` writes one group (stills, opencv, av or pcm) and keeps the manifest entries
 of the others, so adding a group does not re-encode the files already committed.
 The av group needs ffmpeg, the opencore-amr and vo-amrwbenc libraries for AMR
-(Homebrew has both), and sips from macOS for HEIC.
+(Homebrew has both), and sips from macOS for HEIC. The pcm group needs ffmpeg and
+macOS's afconvert, which writes AIFF, AIFF-C and CAF with Apple's own code.
 
 One of the JPEGs carries an EXIF thumbnail, which is a whole JPEG inside the
 APP1 segment. That is the case a carver has to get right: the thumbnail must not
@@ -61,7 +62,30 @@ def write_media(out_dir, only=None):
         _write_videos(out_dir, record)
     if only in (None, "av"):
         _write_av(out_dir, record)
+    if only in (None, "pcm"):
+        _write_pcm(out_dir, record)
     return made
+
+
+def _write_pcm(out_dir, record):
+    """WAV from FFmpeg; AIFF, AIFF-C and CAF from Apple's afconvert."""
+    ffmpeg, afconvert = shutil.which("ffmpeg"), shutil.which("afconvert")
+    if not ffmpeg:
+        print("  ffmpeg absent: no pcm fixtures written", file=sys.stderr)
+        return
+    path = lambda name: os.path.join(out_dir, name)
+    noise = ("-f", "lavfi", "-i", "anoisesrc=duration=0.5:seed=9", "-ac", "1", "-ar", "8000")
+    _run(ffmpeg, "-hide_banner", "-y", *noise, "-c:a", "pcm_s16le", "-bitexact",
+         "-map_metadata", "-1", path("plain.wav"))
+    record("plain.wav", "wav")
+    if not afconvert:
+        print("  afconvert absent: no AIFF, AIFF-C or CAF fixtures written", file=sys.stderr)
+        return
+    for name, kind, args in (("plain.aiff", "aiff", ("-f", "AIFF", "-d", "BEI16")),
+                             ("plain.aifc", "aiff", ("-f", "AIFC", "-d", "ima4")),
+                             ("plain.caf", "caf", ("-f", "caff", "-d", "aac"))):
+        _run(afconvert, *args, path("plain.wav"), path(name))
+        record(name, kind)
 
 
 def _write_stills(out_dir, record):
@@ -247,7 +271,7 @@ def _write_videos(out_dir, record):
 
 def main(argv):
     only = None
-    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av"):
+    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm"):
         only = argv[3]
     elif len(argv) != 2:
         print(__doc__)

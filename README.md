@@ -66,7 +66,7 @@ mediacarve list  disk.raw -v                 # one line per file
 mediacarve carve disk.raw -o carved/         # write the files out
 mediacarve carve disk.raw -o carved.zip      # or into a zip
 mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic
-mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr
+mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, wav, aiff, caf
 ```
 
 ## Lengths are parsed, not guessed
@@ -83,11 +83,16 @@ length was arrived at:
 JPEG walks its markers rather than searching for the end-of-image marker, which
 matters because an EXIF thumbnail is a whole JPEG inside the APP1 segment: the
 segment's own length steps over it, so the thumbnail neither truncates the file
-nor gets reported as a second one. PNG sums chunks to IEND and checks the CRC of
+nor gets reported as a second one. A scan is only taken after a frame header,
+with a scan header of the length ITU-T T.81 fixes. PNG sums chunks to IEND and checks the CRC of
 every critical chunk, GIF walks blocks to the trailer, and RIFF and ISO-BMFF read
 their own recorded sizes once the file opens with the chunk or box its format
-requires: `LIST hdrl` for AVI, a VP8 chunk for WebP, and a box mediacarve knows
-after any vendor box.
+requires: `LIST hdrl` for AVI, a VP8 chunk for WebP, `fmt ` and `data` for WAV,
+`COMM` for AIFF and AIFF-C, and a box mediacarve knows after any vendor box.
+
+CAF records no total size, so its chunks are walked until one is not a type
+Apple's CAF specification defines. Its audio data chunk may give its size as -1,
+unknown; such a file has no end a carver can find and is not reported.
 
 Ogg walks its pages and checks each one's CRC, the page sequence of each stream,
 and the end-of-stream flag. Not every writer sets that flag, so a file ends at the
@@ -142,6 +147,9 @@ dated, path-anchored files.
 | `ogg` | Ogg audio | from the codec: `.opus`, `.spx`, `.oga` (FLAC), otherwise `.ogg` |
 | `ogv` | Ogg with a Theora stream | `.ogv` |
 | `amr` | AMR and AMR-WB storage files | `.amr`, `.awb` |
+| `wav` | WAV (RIFF WAVE) | `.wav` |
+| `aiff` | AIFF and AIFF-C | `.aiff`, `.aifc` |
+| `caf` | Core Audio Format | `.caf` |
 
 `-k images`, `-k video` and `-k audio` select the groups. The brand is read from
 the `ftyp` box against the [MP4 registration authority's list](https://github.com/mp4ra/mp4ra.github.io/blob/35c6ffec3216d1d0d50671a68509ec4ddbf3c9b5/data/brands.csv).
@@ -267,6 +275,35 @@ are new, 328 of which one of them does; and 29 Ogg Vorbis files are new.
 images. Of the 38,585 that 0.2.0 returns at exactly their file size, this walk
 returns 38,583 the same way. The other two fail their IDAT CRC and do not decode.
 
+**WAV, AIFF and CAF on known data.** 3,900 distinct files from public phone
+images (up to 400 per format per image: 1,247 WAV, 386 AIFF, 218 AIFF-C, 2,049
+CAF) were laid into an image between runs of zeros, and again between random
+bytes, with the same result both times:
+
+| format | exact | within 8 bytes | other | not reported |
+| --- | ---: | ---: | ---: | ---: |
+| WAV | 1,222 | 23 | 0 | 2 |
+| AIFF and AIFF-C | 599 | 4 | 1 | 0 |
+| CAF | 1,474 | 6 | 66 | 503 |
+
+The WAV and AIFF lengths that are off are files whose RIFF or FORM size is not
+the file's size, by 1 to 8 bytes (18 for the one AIFF). The 2 WAVs not reported
+carry a RIFF size of 0xFFFFFFFF, a streaming writer's "unknown". The 66 CAFs
+have an info chunk that declares one byte less than it holds, so the walk stops
+there with all the audio and without the 45 to 267 bytes of chunks after it.
+The 503 CAFs not reported give their audio data size as -1; all but one are
+uncompressed, and every such file in `abe_ios16` and `dexter_ios18`, 986 in
+all, is one of Apple's text-to-speech voice assets under MobileAsset.
+
+That run also found three JPEG-shaped runs in the raw audio, each FFD8FF
+straight into an FFDA "scan" of about 65,500 bytes, ending 65 KB later. None
+decodes, and one hid a WAV behind it. A JPEG now needs a frame header before its
+scan and a scan header of 6 + 2 x Ns bytes (ITU-T T.81, Figure B.2 and Table
+B.3). On 26,261 JPEGs sampled the same way as the PNGs, every one that the
+earlier JPEG walk returned at exactly its file size, 23,778, still is. On the five volumes the
+only change from 0.3.0 is 8 WAVs on `android-root-ext4`, all of which decode;
+PhotoRec found no WAV, AIFF or CAF on any of them.
+
 **Controls.** For the audio kinds, each of these was broken in turn and made its
 own test fail: the Ogg CRC check, the page sequence check, the rule that first
 pages come before any other, taking a first page cut off by the end of the stream
@@ -279,7 +316,11 @@ anyway. The same was done for the false-extent fixes: capped hits hiding others,
 the AVI `hdrl` rule, the WebP first chunk, the AVI first chunk fitting its RIFF,
 the PNG CRC check, checking only IHDR and IEND instead of every critical chunk,
 checking every chunk instead, the empty IEND, the IDAT requirement, IHDR first,
-CgBI ahead of IHDR, the PNG ceiling, and the old 128-byte floor.
+CgBI ahead of IHDR, the PNG ceiling, and the old 128-byte floor. And for 0.4.0:
+the JPEG frame-header rule, the scan header length, the Ns range, the WAV
+`fmt `/`data` walk, the AIFF `COMM` walk, the FORM type in the signature, CAF's
+`desc` first, CAF's listed chunk types, CAF's chunk past the stream, and CAF's
+negative sizes.
 
 ## Tests
 
