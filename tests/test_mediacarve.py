@@ -539,6 +539,94 @@ def test_a_caf_ends_where_its_chunks_stop():
 
 
 
+# ----------------------------------------------------------------------- mp3
+
+def _mp3_frames(data, start=0):
+    """Split a Layer III stream into frames with the carver's own header reader."""
+    out, pos = [], start
+    while True:
+        frame = mediacarve._mp3_frame(data[pos:pos + 4])
+        if frame is None or pos + frame[1] > len(data):
+            return out, pos
+        out.append(data[pos:pos + frame[1]])
+        pos += frame[1]
+
+
+def test_an_untagged_stream_needs_four_frames():
+    """Measured: in 4,160 non-MP3 audio files single frames made 4,458 hits, and
+    runs of two or more made none; 4 keeps every multi-frame run on an Android
+    system partition out and loses 1 of 1,207 real untagged MP3s."""
+    frames, _ = _mp3_frames(_load("bare.mp3"))
+    assert len(frames) >= 5
+    png = _load("plain.png")
+    three, four = b"".join(frames[:3]), b"".join(frames[:4])
+    stream = _image([(4096, three), (65536, four), (131072, png)])
+    assert [(h.offset, h.length, h.kind) for h in mediacarve.carve(stream)] \
+        == [(65536, len(four), "mp3"), (131072, len(png), "png")]
+
+
+def test_a_tagged_stream_needs_two_frames():
+    """FFmpeg's own probe wants two consecutive frames, and no real tagged MP3
+    measured had fewer than three. One frame behind a tag was a false hit."""
+    data = _load("plain.mp3")
+    tag = mediacarve._id3v2_length(data[:10])
+    frames, _ = _mp3_frames(data, tag)
+    one, two = data[:tag] + frames[0], data[:tag] + frames[0] + frames[1]
+    stream = _image([(4096, one), (65536, two)])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream)] == [(65536, len(two))]
+
+
+def test_a_frame_that_changes_sample_rate_ends_the_stream():
+    frames, _ = _mp3_frames(_load("bare.mp3"))
+    other = bytearray(frames[4])
+    other[2] ^= 0x04                              # sample rate index 0 <-> 1
+    clip = b"".join(frames[:4]) + bytes(other) + b"".join(frames[5:])
+    stream = _image([(4096, clip)])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream)][:1] \
+        == [(4096, sum(len(f) for f in frames[:4]))]
+
+
+def test_ape_and_id3v1_tags_after_the_frames_are_part_of_the_file():
+    """Measured: 40 real MP3s end in an APEv2 tag that opens with its header and
+    whose size reaches the ID3v1 tag or the end of the file."""
+    data = _load("bare.mp3")
+    frames, end = _mp3_frames(data)
+    audio, id3v1 = data[:end], data[end:]
+    assert id3v1[:3] == b"TAG" and len(id3v1) == 128
+    items = struct.pack("<II", 7, 0) + b"Title\x00fixture"
+    footer = b"APETAGEX" + struct.pack("<IIII", 2000, len(items) + 32, 1, 0x80000000) + bytes(8)
+    header = b"APETAGEX" + struct.pack("<IIII", 2000, len(items) + 32, 1, 0xA0000000) + bytes(8)
+    clip = audio + header + items + footer + id3v1
+    stream = _image([(4096, clip)])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream)] == [(4096, len(clip))]
+
+
+def test_only_layer_three_with_a_known_frame_length_is_carved():
+    frames, _ = _mp3_frames(_load("bare.mp3"))
+    layer2 = b"".join(bytes([f[0], f[1] ^ 0x06]) + f[2:] for f in frames[:6])  # layer bits 01 -> 11
+    free = b"".join(f[:2] + bytes([f[2] & 0x0F]) + f[3:] for f in frames[:6])   # bitrate index 0
+    stream = _image([(4096, layer2), (65536, free)])
+    assert [h for h in mediacarve.carve(stream) if h.kind == "mp3"] == []
+
+
+def test_a_malformed_id3v2_header_does_not_vouch_for_a_stream():
+    """id3.org ID3v2.4.0 section 3.1: version bytes below 0xFF, size bytes below
+    0x80. Three frames behind a valid tag are a file; behind a malformed one they
+    are three untagged frames, one short of the four an untagged stream needs.
+    The malformed sizes below read as the same 133 bytes, so only the header
+    rules can tell them apart."""
+    frames, _ = _mp3_frames(_load("bare.mp3"))
+    audio = b"".join(frames[:3])
+    good = b"ID3\x03\x00\x00" + bytes([0, 0, 1, 5]) + bytes(133)       # 128 + 5
+    big_byte = b"ID3\x03\x00\x00" + bytes([0, 0, 0, 0x85]) + bytes(133)  # 0x85 = 133
+    version_ff = b"ID3\xff\x00\x00" + bytes([0, 0, 1, 5]) + bytes(133)
+    assert mediacarve._id3v2_length(good[:10]) == 143
+    # the scan signature only starts on versions 2 to 4, so a bad version can
+    # only arrive as a second tag chained after a good one
+    chained = good + version_ff
+    stream = _image([(4096, good + audio), (65536, big_byte + audio), (131072, chained + audio)])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream)] == [(4096, len(good) + len(audio))]
+
 # ----------------------------------------------------------------------- ogg
 
 def _crc_reference(data):

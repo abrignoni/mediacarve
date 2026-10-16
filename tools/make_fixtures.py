@@ -11,7 +11,7 @@ themselves need nothing but pytest.
     python tools/make_fixtures.py tests/fixtures/media
     python tools/make_fixtures.py tests/fixtures/media --only av
 
-``--only`` writes one group (stills, opencv, av or pcm) and keeps the manifest entries
+``--only`` writes one group (stills, opencv, av, pcm or mp3) and keeps the manifest entries
 of the others, so adding a group does not re-encode the files already committed.
 The av group needs ffmpeg, the opencore-amr and vo-amrwbenc libraries for AMR
 (Homebrew has both), and sips from macOS for HEIC. The pcm group needs ffmpeg and
@@ -64,7 +64,36 @@ def write_media(out_dir, only=None):
         _write_av(out_dir, record)
     if only in (None, "pcm"):
         _write_pcm(out_dir, record)
+    if only in (None, "mp3"):
+        _write_mp3(out_dir, record)
     return made
+
+
+def _write_mp3(out_dir, record):
+    """MP3 from FFmpeg's LAME encoder: one with an ID3v2 tag and a Xing frame, one
+    with neither, so a bare frame sync starts it, and an ID3v1 tag at the end.
+
+    FFmpeg 7.1's write_id3v1 option did not write the tag here, so the 128-byte
+    ID3v1 block ("TAG", title, artist and album of 30 bytes, year of 4, comment
+    of 30, genre of 1) is appended to the encoder's output by this tool.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print("  ffmpeg absent: no mp3 fixtures written", file=sys.stderr)
+        return
+    path = lambda name: os.path.join(out_dir, name)
+    src = ("-f", "lavfi", "-i", "anoisesrc=duration=1:seed=13", "-ac", "1", "-ar", "22050")
+    _run(ffmpeg, "-hide_banner", "-y", *src, "-c:a", "libmp3lame", "-b:a", "32k",
+         "-metadata", "title=fixture", "-id3v2_version", "3", "-bitexact", path("plain.mp3"))
+    record("plain.mp3", "mp3")
+    _run(ffmpeg, "-hide_banner", "-y", *src, "-c:a", "libmp3lame", "-b:a", "32k",
+         "-write_xing", "0", "-id3v2_version", "0", "-bitexact", path("bare.mp3"))
+    id3v1 = (b"TAG" + b"fixture".ljust(30, b"\x00") + bytes(30) + bytes(30) + b"2026"
+             + bytes(30) + b"\xff")
+    assert len(id3v1) == 128
+    with open(path("bare.mp3"), "ab") as out:
+        out.write(id3v1)
+    record("bare.mp3", "mp3")
 
 
 def _write_pcm(out_dir, record):
@@ -271,7 +300,7 @@ def _write_videos(out_dir, record):
 
 def main(argv):
     only = None
-    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm"):
+    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3"):
         only = argv[3]
     elif len(argv) != 2:
         print(__doc__)

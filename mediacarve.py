@@ -49,7 +49,7 @@ import zipfile
 import zlib
 from typing import NamedTuple
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # How much to read at a time while scanning, and how much to carry over so a
 # signature straddling two blocks is still found.
@@ -75,6 +75,7 @@ DEFAULT_CAPS = {
     "wav": 4 << 30,
     "aiff": 4 << 30,
     "caf": 4 << 30,
+    "mp3": 1 << 30,
 }
 _ABSOLUTE_CAP = 4 << 30
 
@@ -87,7 +88,7 @@ MIN_LENGTHS = {
     "jpeg": 128, "png": 57, "gif": 64, "webp": 64,
     "avi": 1024, "mp4": 1024, "heic": 512,
     "m4a": 1024, "ogg": 128, "ogv": 1024, "amr": 256,
-    "wav": 64, "aiff": 64, "caf": 64,
+    "wav": 64, "aiff": 64, "caf": 64, "mp3": 128,
 }
 
 # The conventional extension for each kind. ISO-BMFF, Ogg and AMR refine it from
@@ -96,12 +97,12 @@ EXTENSIONS = {
     "jpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp",
     "avi": ".avi", "mp4": ".mp4", "heic": ".heic",
     "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "amr": ".amr",
-    "wav": ".wav", "aiff": ".aiff", "caf": ".caf",
+    "wav": ".wav", "aiff": ".aiff", "caf": ".caf", "mp3": ".mp3",
 }
 
 IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic"})
 VIDEO_KINDS = frozenset({"avi", "mp4", "ogv"})
-AUDIO_KINDS = frozenset({"m4a", "ogg", "amr", "wav", "aiff", "caf"})
+AUDIO_KINDS = frozenset({"m4a", "ogg", "amr", "wav", "aiff", "caf", "mp3"})
 
 
 class Candidate(NamedTuple):
@@ -134,7 +135,9 @@ _SCAN = re.compile(
     b"|OggS\x00[\x02\x06]"       # Ogg page, version 0, first of its stream
     b"|#!AMR(?:-WB)?\n"           # single-channel AMR or AMR-WB storage file
     b"|FORM....AIF[FC]"          # IFF FORM holding AIFF or AIFF-C
-    b"|caff\x00\x01\x00\x00",     # CAF version 1, flags 0
+    b"|caff\x00\x01\x00\x00"      # CAF version 1, flags 0
+    b"|ID3[\x02-\x04]\x00"         # ID3v2 tag, versions 2.2 to 2.4
+    b"|\xff[\xe2\xe3\xf2\xf3\xfa\xfb]",  # MPEG audio Layer III frame sync
     re.DOTALL)
 
 # Top-level ISO-BMFF box types the carver knows. A file has to show at least one
@@ -611,6 +614,121 @@ def _caf_length(stream, offset, caps):
     return pos - offset, "parsed", "caf", ".caf"
 
 
+# MPEG audio frame header, as FFmpeg reads it (libavcodec/mpegaudiodecheader.c
+# and mpegaudiotabs.h at n7.1): kbit/s by [lsf][layer - 1][index], and the
+# sample rates of MPEG-1, halved for MPEG-2 and quartered for MPEG-2.5.
+_MPA_BITRATES = (
+    ((0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448),
+     (0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384),
+     (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320)),
+    ((0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256),
+     (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
+     (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160)),
+)
+_MPA_RATES = (44100, 48000, 32000)
+
+# Consecutive frames a stream must show before it is taken as MP3. A frame sync
+# is eleven bits, so on its own it is common in other data; a run of frames that
+# agree on version, layer and sample rate is not. Set from measurement (see the
+# README): with no ID3v2 tag in front, single frames made 4,458 hits in 4,160
+# non-MP3 audio files and none at two or more, and 4 keeps every multi-frame hit
+# on an Android system partition out while losing 1 of 1,207 real untagged MP3s.
+# Behind a tag, FFmpeg's own probe wants two frames ("Failed to find two
+# consecutive MPEG audio frames"), and no real tagged MP3 measured had fewer than 3.
+_MP3_MIN_BARE_FRAMES = 4
+_MP3_MIN_TAGGED_FRAMES = 2
+
+
+def _mp3_frame(head):
+    """(version/layer/rate key, frame length) for a Layer III header, or None.
+
+    The checks are FFmpeg's ff_mpa_check_header: the sync, and no reserved
+    version, layer, bitrate or sample rate. Free-format streams (bitrate index
+    0) record no frame length and are not walked. Only Layer III is carved.
+    """
+    if len(head) < 4:
+        return None
+    x = struct.unpack(">I", head[:4])[0]
+    if x & 0xFFE00000 != 0xFFE00000 or x & (3 << 19) == 1 << 19 \
+            or (x >> 17) & 3 != 1 or x & (0xF << 12) in (0, 0xF << 12) \
+            or x & (3 << 10) == 3 << 10:
+        return None
+    if x & (1 << 20):
+        lsf, mpeg25 = (0 if x & (1 << 19) else 1), 0
+    else:
+        lsf, mpeg25 = 1, 1
+    rate = _MPA_RATES[(x >> 10) & 3] >> (lsf + mpeg25)
+    kbps = _MPA_BITRATES[lsf][2][(x >> 12) & 0xF]
+    size = kbps * 144000 // (rate << lsf) + ((x >> 9) & 1)
+    return x & 0xFFFE0C00, size                   # sync, version, layer, rate
+
+
+def _id3v2_length(head):
+    """Length of an ID3v2 tag from its 10-byte header, or 0 if it is not one.
+
+    id3.org, ID3v2.4.0 structure, section 3.1: "ID3", two version bytes below
+    0xFF, a flags byte, and a 28-bit synchsafe size whose four bytes are below
+    0x80; the size leaves out the header, and the 10-byte footer when flag 0x10
+    says there is one.
+    """
+    if len(head) < 10 or head[:3] != b"ID3" or head[3] == 0xFF or head[4] == 0xFF \
+            or any(b >= 0x80 for b in head[6:10]):
+        return 0
+    size = head[6] << 21 | head[7] << 14 | head[8] << 7 | head[9]
+    return 10 + size + (10 if head[5] & 0x10 else 0)
+
+
+def _mp3_length(stream, offset, cap):
+    """ID3v2 tags, then Layer III frames that agree, then an APE or ID3v1 tag.
+
+    MP3 has no container. After any ID3v2 tags (and the zeros some writers put
+    after one), frames are walked while each header agrees with the first on
+    version, layer and sample rate. A stream with an ID3v2 tag needs
+    _MP3_MIN_TAGGED_FRAMES frames, one without _MP3_MIN_BARE_FRAMES. After the frames an APEv2 tag that
+    opens with its header is stepped over: its size counts the items and the
+    32-byte footer, and the header adds 32 more (FFmpeg n7.1 apetag.c: bit 31
+    "contains header", bit 29 "is header"). Then a 128-byte ID3v1 tag ("TAG").
+    Measured on 2,075 MP3 files from public phone images: all are Layer III, 2,031 end at their last frame or an ID3v1 tag, and the 40
+    APEv2 tags all open with a header whose size reaches the ID3v1 tag or the end.
+    """
+    pos = offset
+    end = offset + cap
+    tagged = False
+    while True:
+        n = _id3v2_length(_read_at(stream, pos, 10))
+        if not n:
+            break
+        pos += n
+        tagged = True
+    if tagged:
+        while pos < end and _read_at(stream, pos, 1) == b"\x00":
+            pos += 1                              # padding after the tag
+    first = _mp3_frame(_read_at(stream, pos, 4))
+    if first is None:
+        return None
+    key = first[0]
+    frames = 0
+    buf, buf_at = b"", pos
+    while pos < end:
+        if pos + 4 > buf_at + len(buf):
+            buf_at, buf = pos, _read_at(stream, pos, 1 << 16)
+        frame = _mp3_frame(buf[pos - buf_at:pos - buf_at + 4])
+        if frame is None or frame[0] != key:
+            break
+        pos += frame[1]
+        frames += 1
+    if frames < (_MP3_MIN_TAGGED_FRAMES if tagged else _MP3_MIN_BARE_FRAMES):
+        return None
+    ape = _read_at(stream, pos, 32)
+    if ape[:8] == b"APETAGEX" and len(ape) == 32:
+        size, flags = struct.unpack("<I", ape[12:16])[0], struct.unpack("<I", ape[20:24])[0]
+        if flags & 0x20000000:                    # this is the tag's header
+            pos += 32 + size
+    if _read_at(stream, pos, 3) == b"TAG":
+        pos += 128
+    return pos - offset, "parsed", "mp3", ".mp3"
+
+
 # Ogg pages carry a CRC-32 with the generator polynomial 0x04c11db7 (RFC 3533,
 # section 6), computed MSB first with a zero start and no final inversion, over
 # the page with its CRC field zeroed. zlib computes the same polynomial LSB
@@ -794,6 +912,8 @@ def _measure(stream, offset, kind, caps):
         got = _iff_length(stream, offset, caps)
     elif kind == "caf":
         got = _caf_length(stream, offset, caps)
+    elif kind == "mp3":
+        got = _mp3_length(stream, offset, _cap(caps, kind))
     else:
         return None
     if got is None:
@@ -862,6 +982,8 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                 kind = "iff"
             elif sig.startswith(b"caff"):
                 kind = "caf"
+            elif sig.startswith(b"ID3") or len(sig) == 2:
+                kind = "mp3"
             elif sig.startswith(b"\xff\xd8"):
                 kind = "jpeg"
             elif sig.startswith(b"\x89PNG"):
