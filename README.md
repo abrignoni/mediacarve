@@ -1,6 +1,7 @@
 # mediacarve
 
-Recover images, video and audio from any stream of bytes, by signature. One file, pure
+Recover images, video, audio and, when asked, SQLite databases from any stream of
+bytes, by signature. One file, pure
 Python, standard library only. No compiler, no network, nothing to install.
 
 ```python
@@ -67,6 +68,8 @@ mediacarve carve disk.raw -o carved/         # write the files out
 mediacarve carve disk.raw -o carved.zip      # or into a zip
 mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic
 mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, wav, aiff, caf, mp3
+mediacarve carve disk.raw -o out/ -k databases   # sqlite
+mediacarve carve disk.raw -o out/ -k all     # media and databases
 ```
 
 ## Lengths are parsed, not guessed
@@ -156,8 +159,13 @@ dated, path-anchored files.
 | `aiff` | AIFF and AIFF-C | `.aiff`, `.aifc` |
 | `caf` | Core Audio Format | `.caf` |
 | `mp3` | MPEG audio Layer III, with ID3v2, APEv2 and ID3v1 tags | `.mp3` |
+| `sqlite` | SQLite 3 database (asked for with `-k databases` or `-k all`) | `.sqlite` |
 
-`-k images`, `-k video` and `-k audio` select the groups. The brand is read from
+`-k images`, `-k video` and `-k audio` select the groups. Without `-k`, and with
+`kinds` left out of `carve()`, the media kinds are carved and nothing else, so a
+caller gets what it got before databases were added. `-k databases` adds SQLite
+and `-k all` carves both. A database hides nothing found inside it, and nothing
+hides a database. The brand is read from
 the `ftyp` box against the [MP4 registration authority's list](https://github.com/mp4ra/mp4ra.github.io/blob/35c6ffec3216d1d0d50671a68509ec4ddbf3c9b5/data/brands.csv).
 A brand only says what the writer declared: an audio-only file written with the
 generic `mp42` brand is reported as `mp4`, and 29 of 59 distinct `.m4a` files
@@ -360,6 +368,54 @@ ID3v1 tags, and the ID3v2 size bytes and version. Two could not be shown that
 way: allowing free-format frames made the walk loop on zero-length frames, so
 the run never finished, and a Layer I or II stream is measured with the Layer III
 frame formula and falls apart without the layer rule.
+
+**SQLite.** A database's length is its in-header page count times its page size,
+counted only when SQLite vouches for it: not zero, and the change counter equal
+to the version-valid-for number (sqlite.org fileformat2, 1.3.7). The rest of the
+header is checked against the same document: page size, versions, payload
+fractions, schema format, text encoding and the reserved bytes.
+
+On 8,700 databases taken by their header from 29 public phone images, laid
+between zeros and again between random bytes, 8,669 came back at exactly their
+size both times. 7 differ, because their page count and file size disagree. 24
+are not reported: 15 have no page count (SQLite before 3.7.0 did not keep it),
+and 9 are encrypted after their first 32 bytes, which the `sqlite3` library will
+not open either. Media inside those databases came out the same, 7,752 hits,
+whether or not databases were asked for.
+
+That run found that a picture stored as a blob, spread over a database's pages,
+can claim the next file: one HEIC ran 34,095 bytes into the next database. So
+nothing hides a database.
+
+On the two Android ext4 volumes, the file table gives every database's start and
+size. All 653 SQLite files on `android-root-ext4` and all 403 on
+`android-userdata-ext4` come back at exactly their size, every one opens in the
+`sqlite3` library and passes `quick_check` (16 need an app's own collation to be
+checked), and no other database hit is reported. Before one more rule there were
+435 other hits, all copies of page 1 inside WAL files: a write-ahead log or a
+rollback journal keeps page copies behind their page number (fileformat2, 4.1
+and 3), and a header preceded by page number 1 in that place is now taken as a
+copy. On 1,740 real WAL files and 277 rollback journals from public phone
+images, that rule takes 14,611 of 14,621 WAL hits and 328 of 330 journal hits
+out. The 10 WAL hits left are page copies whose frame header is zeroed but for
+its checksum; the 2 journal hits are files named `-journal` that are whole
+databases, which open. On `windows-ntfs` all 52 database hits open and pass
+`quick_check`, and on `macos-apfs` 19 of 22 do and 3 need a collation named
+`IDBKEY` that their app supplies.
+
+PhotoRec 7.2, run as above, reports no SQLite on either Android volume. A control
+image holding one database and one JPEG, run the same way, recovers the JPEG and
+not the database, so with these options PhotoRec does not carve SQLite at all.
+
+On all five volumes a run without `-k` is the same, hit for hit, as 0.5.0, and
+asking for databases changes none of the media hits.
+
+Each SQLite rule was broken in turn and made its own test fail: media only by
+default, a database hiding what is inside it, a hit hiding a database, the
+version-valid-for check, the page size, the versions, the payload fractions,
+the schema format, the text encoding, the reserved bytes, and the WAL and
+journal page-number rules. A page count of 0 is also refused by the length
+floor, so that rule cannot be shown alone.
 
 ## Tests
 

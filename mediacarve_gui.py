@@ -37,7 +37,7 @@ sys.path.insert(0, HERE)
 import mediacarve  # noqa: E402  pylint: disable=wrong-import-position
 
 TITLE = "mediacarve"
-KINDS = ("all", "images", "video", "audio")
+KINDS = ("media", "images", "video", "audio", "databases", "all")
 PERCENT = re.compile(r"(\d+(?:\.\d+)?)%")
 
 
@@ -86,7 +86,7 @@ def build_window(initial_image="", smoke=None):
     form.pack(fill="x")
     v_image = tk.StringVar(value=initial_image)
     v_output = tk.StringVar()
-    v_kinds = tk.StringVar(value="all")
+    v_kinds = tk.StringVar(value="media")
     v_nested = tk.BooleanVar(value=False)
 
     ttk.Label(form, text="Image").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
@@ -156,7 +156,7 @@ def build_window(initial_image="", smoke=None):
             return
         args = probe_command() + (["list", "--verbose"] if mode == "count" else ["carve"])
         kinds = v_kinds.get().strip()
-        if kinds and kinds != "all":
+        if kinds and kinds != "media":
             args += ["--kinds", kinds]
         if v_nested.get():
             args.append("--nested")
