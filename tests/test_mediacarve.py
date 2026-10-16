@@ -828,6 +828,215 @@ def test_an_offset_outside_the_object_data_is_not_a_plist():
 
 
 
+# ----------------------------------------------------------------------- zip
+
+class _NoSeek(io.RawIOBase):
+    """A write-only stream zipfile cannot seek, so it writes data descriptors."""
+    def __init__(self):
+        self.out = bytearray()
+    def writable(self):
+        return True
+    def write(self, b):
+        self.out += b
+        return len(b)
+
+
+def _zip(members, *, streamed=False, stored=False):
+    import zipfile
+    method = zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED
+    if streamed:
+        sink = _NoSeek()
+        with zipfile.ZipFile(sink, "w", method) as z:
+            for name, data in members:
+                z.writestr(name, data)
+        return bytes(sink.out)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", method) as z:
+        for name, data in members:
+            z.writestr(name, data)
+    return buf.getvalue()
+
+
+def test_archives_are_carved_only_when_asked_for():
+    archive, png = _load("small.zip"), _load("plain.png")
+    stream = _image([(4096, archive), (65536, png)])
+    assert [h.kind for h in mediacarve.carve(stream)] == ["png"]
+    for kinds in ({"zip"}, mediacarve._kinds_arg("archives"), mediacarve._kinds_arg("all")):
+        assert ("zip", len(archive)) in [(h.kind, h.length) for h in mediacarve.carve(stream, kinds=kinds)]
+
+
+def test_a_zip_hides_the_zips_in_it_but_no_media():
+    import zipfile
+    inner = _zip([("a.txt", b"inner " * 50)])
+    png = _load("plain.png")
+    outer = _zip([("inner.zip", inner), ("picture.png", png)], stored=True)
+    stream = _image([(4096, outer)])
+    hits = sorted((h.offset, h.kind, h.length) for h in mediacarve.carve(stream, kinds=mediacarve.ALL_KINDS))
+    assert hits == [(4096, "zip", len(outer)), (4096 + outer.find(png), "png", len(png))]
+
+
+def test_a_descriptor_is_taken_only_at_the_distance_it_records():
+    """A ZIP stored inside a streamed entry has local headers, a central
+    directory and descriptors of its own; none of them ends the outer entry,
+    because their recorded sizes do not match the distance from its start."""
+    inner = _zip([("x.txt", b"x" * 400), ("y.txt", b"y" * 300)], streamed=True)
+    outer = _zip([("inner.zip", inner), ("after.txt", b"after " * 40)], streamed=True, stored=True)
+    stream = _image([(4096, outer)])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream, kinds={"zip"})] == [(4096, len(outer))]
+
+
+def _with_apk_block(archive, gap):
+    """Insert ``gap`` zeros and an APK signing block before the central directory
+    and move the end record's directory offset to match."""
+    eocd = archive.rfind(b"PK\x05\x06")
+    cd_off = struct.unpack("<I", archive[eocd + 16:eocd + 20])[0]
+    pairs = struct.pack("<Q", 4 + 20) + struct.pack("<I", 0x7109871A) + b"s" * 20
+    size = len(pairs) + 8 + 16
+    block = struct.pack("<Q", size) + pairs + struct.pack("<Q", size) + b"APK Sig Block 42"
+    moved = cd_off + gap + len(block)
+    tail = archive[cd_off:eocd] + archive[eocd:eocd + 16] + struct.pack("<I", moved) + archive[eocd + 20:]
+    return archive[:cd_off] + bytes(gap) + block + tail
+
+
+def test_whatever_lies_before_the_central_directory_is_part_of_the_file():
+    """source.android.com: an APK signing block sits before the central
+    directory. Measured on real APKs: zeros before it, more entries after it,
+    and entries the directory does not list. The walk does not read that span;
+    the end record, pointing back to the first header, decides."""
+    archive = _zip([("AndroidManifest.xml", b"<manifest/>"), ("classes.dex", b"dex\n035" + bytes(500))])
+    for gap in (0, 4094):
+        apk = _with_apk_block(archive, gap)
+        stream = _image([(4096, apk)])
+        assert [(h.offset, h.length, h.ext) for h in mediacarve.carve(stream, kinds={"zip"})] \
+            == [(4096, len(apk), ".apk")], gap
+    odd = bytearray(_with_apk_block(archive, 64))
+    odd[archive.find(b"PK\x01\x02") + 10] = 0xFF  # not zeros before the block
+    at = bytes(odd).find(b"APK Sig Block 42")
+    odd[at - 8] ^= 1                              # and its two sizes disagree
+    stream = _image([(4096, bytes(odd))])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream, kinds={"zip"})] == [(4096, len(odd))]
+
+
+def _zip_with_junk(junk_after, junk):
+    """An archive with ``junk`` inserted after entry ``junk_after``, its central
+    directory's local header offsets and its own offset moved to match."""
+    archive = _zip([(f"part{i}.txt", (f"part {i} " * 80).encode()) for i in range(4)])
+    eocd = archive.rfind(b"PK\x05\x06")
+    cd_off = struct.unpack("<I", archive[eocd + 16:eocd + 20])[0]
+    cd = bytearray(archive[cd_off:eocd])
+    offsets, pos = [], 0
+    while pos < len(cd):
+        offsets.append(struct.unpack("<I", cd[pos + 42:pos + 46])[0])
+        nl, xl, cl = struct.unpack("<HHH", cd[pos + 28:pos + 34])
+        pos += 46 + nl + xl + cl
+    cut = offsets[junk_after + 1]
+    pos = 0
+    while pos < len(cd):
+        lo = struct.unpack("<I", cd[pos + 42:pos + 46])[0]
+        if lo >= cut:
+            cd[pos + 42:pos + 46] = struct.pack("<I", lo + len(junk))
+        nl, xl, cl = struct.unpack("<HHH", cd[pos + 28:pos + 34])
+        pos += 46 + nl + xl + cl
+    end = bytearray(archive[eocd:])
+    end[16:20] = struct.pack("<I", cd_off + len(junk))
+    return archive[:cut] + junk + archive[cut:cd_off] + bytes(cd) + bytes(end)
+
+
+def test_bytes_no_entry_accounts_for_do_not_stop_the_walk():
+    """Measured on real APKs: about 15 KB after an entry the central directory
+    does not list, and a stray central directory header followed by more
+    entries. The end record is searched for from wherever the entries stop."""
+    for junk in (random.Random(4).randbytes(15000), b"PK\x01\x02" + bytes(60) + b"stray"):
+        archive = _zip_with_junk(1, junk)
+        stream = _image([(4096, archive)])
+        assert [(h.offset, h.length) for h in mediacarve.carve(stream, kinds={"zip"})] \
+            == [(4096, len(archive))], junk[:4]
+
+
+def test_an_archive_that_fails_is_walked_once_not_once_per_entry(monkeypatch):
+    """Every local header after the first is a candidate too. A walk that fails
+    marks the headers it passed, so they are not each walked to the same end."""
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        for i in range(200):
+            z.writestr(f"f{i}.txt", b"x" * 50)
+    broken = buf.getvalue()
+    broken = broken[:broken.rfind(b"PK\x05\x06")]          # no end record
+    calls = []
+    real = mediacarve._zip_walk
+    monkeypatch.setattr(mediacarve, "_zip_walk", lambda *a: calls.append(1) or real(*a))
+    assert list(mediacarve.carve(_image([(4096, broken)]), kinds={"zip"})) == []
+    assert len(calls) == 1
+
+
+def test_the_walk_reaches_every_entry_before_the_directory():
+    """The end record decides whether an archive is one. The walk is what gets
+    there without reading every byte, so it has to pass every entry: across a
+    stored ZIP's own descriptors, ZIP64 descriptors, and zeros between entries.
+    A walk that stops early still finds the end record, only more slowly."""
+    import zipfile
+    inner = _zip([("x.txt", b"x" * 400), ("y.txt", b"y" * 300)], streamed=True)
+    nested = _zip([("inner.zip", inner), ("after.txt", b"after " * 40)], streamed=True, stored=True)
+    padded = _zip_with_junk(1, bytes(4000))
+    sink = _NoSeek()                              # ZIP64 extra fields, 8-byte descriptors
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_DEFLATED) as z:
+        for i in range(3):
+            with z.open(f"big{i}.txt", "w", force_zip64=True) as w:
+                w.write(b"zip64 " * 300)
+    cases = ((nested, "nested"), (bytes(sink.out), "zip64 descriptors"),
+             (_load("stream.zip"), "descriptors"), (padded, "zeros"))
+    for archive, name in cases:
+        headers = sorted(i.header_offset for i in zipfile.ZipFile(io.BytesIO(archive)).infolist())
+        visited = []
+        assert mediacarve._zip_walk(io.BytesIO(archive), 0, len(archive), visited, set())
+        assert visited == headers, name
+
+
+def test_a_signature_whose_kinds_were_not_asked_for_is_not_measured(monkeypatch):
+    """Measured on a 33.8 MB APK carved for ZIPs only: 89,932 MP3 walks and 25
+    seconds, because a hit that is dropped covers nothing."""
+    calls = []
+    real = mediacarve._mp3_length
+    monkeypatch.setattr(mediacarve, "_mp3_length", lambda *a: calls.append(1) or real(*a))
+    frames, _ = _mp3_frames(_load("bare.mp3"))
+    stream = _image([(4096, b"".join(frames * 20))])
+    assert list(mediacarve.carve(stream, kinds={"zip"})) == []
+    assert calls == []
+    assert [h.kind for h in mediacarve.carve(stream, kinds={"mp3"})][:1] == ["mp3"]
+
+
+def test_an_end_record_that_does_not_point_back_is_not_a_zip():
+    archive = bytearray(_load("small.zip"))
+    eocd = bytes(archive).rfind(b"PK\x05\x06")
+    for field, delta in ((16, 1), (12, 1), (10, 1)):  # directory offset, size, entries
+        bad = bytearray(archive)
+        if field == 10:
+            bad[10 + eocd] += delta
+        else:
+            value = struct.unpack("<I", bad[eocd + field:eocd + field + 4])[0] + delta
+            bad[eocd + field:eocd + field + 4] = struct.pack("<I", value)
+        assert list(mediacarve.carve(_image([(4096, bytes(bad))]), kinds={"zip"})) == [], field
+
+
+@pytest.mark.parametrize("members,ext", [
+    ([("mimetype", b"application/epub+zip"), ("OEBPS/a.xhtml", b"<html/>")], ".epub"),
+    ([("mimetype", b"application/vnd.oasis.opendocument.text"), ("content.xml", b"<x/>")], ".odt"),
+    ([("[Content_Types].xml", b"<Types/>"), ("word/document.xml", b"<w/>")], ".docx"),
+    ([("[Content_Types].xml", b"<Types/>"), ("xl/workbook.xml", b"<w/>")], ".xlsx"),
+    ([("[Content_Types].xml", b"<Types/>"), ("ppt/presentation.xml", b"<p/>")], ".pptx"),
+    ([("AndroidManifest.xml", b"<m/>"), ("classes.dex", b"dex")], ".apk"),
+    ([("Payload/App.app/Info.plist", b"<plist/>")], ".ipa"),
+    ([("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n")], ".jar"),
+    ([("readme.txt", b"hello")], ".zip"),
+])
+def test_the_extension_comes_from_the_entry_names(members, ext):
+    archive = _zip(members, stored=True)
+    stream = _image([(4096, archive)])
+    assert [h.ext for h in mediacarve.carve(stream, kinds={"zip"})] == [ext]
+
+
+
 # ----------------------------------------------------------------------- ogg
 
 def _crc_reference(data):
