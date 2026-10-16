@@ -50,7 +50,7 @@ import zipfile
 import zlib
 from typing import NamedTuple
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 # How much to read at a time while scanning, and how much to carry over so a
 # signature straddling two blocks is still found.
@@ -77,6 +77,7 @@ DEFAULT_CAPS = {
     "ogv": 4 << 30,
     "mkv": 4 << 30,
     "amr": 64 << 20,
+    "silk": 64 << 20,
     "wav": 4 << 30,
     "aiff": 4 << 30,
     "caf": 4 << 30,
@@ -97,7 +98,7 @@ _ABSOLUTE_CAP = 4 << 30
 MIN_LENGTHS = {
     "jpeg": 128, "png": 57, "gif": 64, "webp": 64,
     "avi": 1024, "mp4": 1024, "heic": 512, "tiff": 64, "bmp": 64, "ico": 64,
-    "m4a": 1024, "ogg": 128, "ogv": 1024, "mkv": 512, "amr": 256,
+    "m4a": 1024, "ogg": 128, "ogv": 1024, "mkv": 512, "amr": 256, "silk": 64,
     "wav": 64, "aiff": 64, "caf": 64, "mp3": 128, "sqlite": 512,
     "sqlite-encrypted": 512, "bplist": 41,
     "zip": 22, "pdf": 64,
@@ -108,7 +109,7 @@ MIN_LENGTHS = {
 EXTENSIONS = {
     "jpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp",
     "avi": ".avi", "mp4": ".mp4", "heic": ".heic", "tiff": ".tif", "bmp": ".bmp", "ico": ".ico",
-    "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "mkv": ".mkv", "amr": ".amr",
+    "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "mkv": ".mkv", "amr": ".amr", "silk": ".silk",
     "wav": ".wav", "aiff": ".aiff", "caf": ".caf", "mp3": ".mp3",
     "sqlite": ".sqlite", "sqlite-encrypted": ".sqlite", "bplist": ".plist", "zip": ".zip",
     "pdf": ".pdf",
@@ -116,7 +117,7 @@ EXTENSIONS = {
 
 IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic", "tiff", "bmp", "ico"})
 VIDEO_KINDS = frozenset({"avi", "mp4", "ogv", "mkv"})
-AUDIO_KINDS = frozenset({"m4a", "ogg", "amr", "wav", "aiff", "caf", "mp3"})
+AUDIO_KINDS = frozenset({"m4a", "ogg", "amr", "silk", "wav", "aiff", "caf", "mp3"})
 MEDIA_KINDS = IMAGE_KINDS | VIDEO_KINDS | AUDIO_KINDS
 DATABASE_KINDS = frozenset({"sqlite", "sqlite-encrypted"})
 PLIST_KINDS = frozenset({"bplist"})
@@ -161,6 +162,8 @@ _SCAN = re.compile(
     b"|ftyp"                     # ISO-BMFF, four bytes in
     b"|OggS\x00[\x02\x06]"       # Ogg page, version 0, first of its stream
     b"|#!AMR(?:-WB)?\n"           # single-channel AMR or AMR-WB storage file
+    b"|#!SILK_V3"                 # SILK; WeChat's byte 0x02 before it is looked for after a
+                                  # match: as "\x02?" here it took 128 MiB from 0.97 to 4.53 s
     b"|FORM....AIF[FC]"          # IFF FORM holding AIFF or AIFF-C
     b"|caff\x00\x01\x00\x00"      # CAF version 1, flags 0
     b"|SQLite format 3\x00"        # SQLite database header
@@ -799,6 +802,54 @@ def _ico_length(stream, offset, cap):
             return None
         end = max(end, at + size)
     return end, "parsed", "ico", ".cur" if kind == 2 else ".ico"
+
+
+# The most bytes a SILK packet can hold: the range coder's buffer (SILK SDK,
+# SKP_Silk_define.h, MAX_ARITHM_BYTES).
+_SILK_MAX_PACKET = 1024
+
+
+def _silk_length(stream, offset, cap):
+    """Walk SILK packets to the file's end.
+
+    The file is "#!SILK_V3" and then packets, each a 16-bit little-endian byte
+    count and that many bytes; the reference encoder ends it with a count of -1,
+    "because it can not end with 0 bytes", and the decoder stops at a negative
+    count or the end of the file (SILK SDK 1.0.9.6, Skype, test/Encoder.c and
+    test/Decoder.c, as kept in kn007/silk-v3-decoder at 507be6b). That copy's
+    encoder also writes WeChat's form, a byte 0x02 before the header and no -1
+    at the end, and WeChat's files measured below are that form, so the walk
+    also ends at the first count that cannot be a packet: 0, or more than a
+    packet can hold.
+
+    Measured on 11 distinct SILK files from public phone images: 8 from WeChat
+    on Android, with no -1, and 3 from iOS ending with it. All 11 end exactly
+    where the walk does, between zeros. None of their 7,180 packets is empty,
+    and none is over 118 bytes. Followed by random bytes, the walk runs on into
+    them in 1.5% of trials of the WeChat files, by up to 1 KiB, the chance that
+    a random count passes for a packet; the files ending with -1 stop there.
+    """
+    head = _read_at(stream, offset, 10)
+    pos = offset + (10 if head[:1] == b"\x02" else 9)
+    end = offset + cap
+    packets = 0
+    while pos + 2 <= end:
+        count = _read_at(stream, pos, 2)
+        if len(count) < 2:
+            break
+        size = struct.unpack("<h", count)[0]
+        if size == -1:
+            pos += 2
+            break
+        if size <= 0 or size > _SILK_MAX_PACKET or pos + 2 + size > end:
+            break
+        if len(_read_at(stream, pos + 2 + size - 1, 1)) < 1:
+            break
+        pos += 2 + size
+        packets += 1
+    if not packets:
+        return None
+    return pos - offset, "parsed"
 
 
 def _cap(caps, kind):
@@ -1810,6 +1861,8 @@ def _measure(stream, offset, kind, caps, dead=None, loose=None):
         got = _ogg_length(stream, offset, caps)
     elif kind == "amr":
         got = _amr_length(stream, offset, _cap(caps, kind))
+    elif kind == "silk":
+        got = _silk_length(stream, offset, _cap(caps, kind))
     elif kind == "iff":
         got = _iff_length(stream, offset, caps)
     elif kind == "caf":
@@ -1847,7 +1900,7 @@ def _measure(stream, offset, kind, caps, dead=None, loose=None):
 # MP3 walks and 25 seconds, against a third of a second without them.
 _SIGNATURE_KINDS = {
     "jpeg": {"jpeg"}, "png": {"png"}, "gif": {"gif"}, "tiff": {"tiff"}, "bmp": {"bmp"}, "ico": {"ico"}, "mkv": {"mkv"}, "riff": {"avi", "webp", "wav"},
-    "bmff": {"mp4", "heic", "m4a"}, "ogg": {"ogg", "ogv"}, "amr": {"amr"},
+    "bmff": {"mp4", "heic", "m4a"}, "ogg": {"ogg", "ogv"}, "amr": {"amr"}, "silk": {"silk"},
     "iff": {"aiff"}, "caf": {"caf"}, "mp3": {"mp3"},
     "sqlite": {"sqlite", "sqlite-encrypted"},
     "bplist": {"bplist"}, "zip": {"zip"}, "pdf": {"pdf"},
@@ -1935,6 +1988,10 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                 kind = "ogg"
             elif sig.startswith(b"#!AMR"):
                 kind = "amr"
+            elif sig == b"#!SILK_V3":
+                kind = "silk"
+                if at > start and _read_at(stream, at - 1, 1) == b"\x02":
+                    at -= 1                       # WeChat's form starts a byte early
             elif sig.startswith(b"FORM"):
                 kind = "iff"
             elif sig.startswith(b"caff"):

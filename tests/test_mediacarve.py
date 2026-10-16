@@ -856,6 +856,53 @@ def test_an_lzw_strip_that_does_not_open_with_a_clear_code_hides_nothing():
     assert [h.kind for h in mediacarve.carve(stream)] == ["tiff", "png"]
 
 
+# ---------------------------------------------------------------------- silk
+
+def _silk(packets=40, wechat=False, terminator=True, seed=12):
+    """SILK framing as the SDK's encoder writes it: the header, then each packet
+    as a 16-bit little-endian byte count and its bytes, then a count of -1; or,
+    as WeChat writes it, 0x02 first and no -1. The payloads are random bytes:
+    this tests the framing, not the codec, which nothing here decodes."""
+    rnd = random.Random(seed)
+    body = b"".join(struct.pack("<h", n) + rnd.randbytes(n)
+                    for n in (rnd.randrange(15, 119) for _ in range(packets)))
+    return (b"\x02" if wechat else b"") + b"#!SILK_V3" + body + (struct.pack("<h", -1) if terminator else b"")
+
+
+@pytest.mark.parametrize("wechat", [False, True])
+def test_a_silk_file_ends_at_its_last_packet(wechat):
+    data = _silk(wechat=wechat, terminator=not wechat)
+    hits = list(mediacarve.carve(_image([(4096, data)])))
+    assert [(h.offset, h.length, h.kind, h.ext, h.bounded) for h in hits] \
+        == [(4096, len(data), "silk", ".silk", "parsed")]
+
+
+def test_a_silk_file_without_its_end_mark_ends_at_a_count_no_packet_has():
+    """A count of 0, or one above the 1,024 bytes a packet can hold
+    (MAX_ARITHM_BYTES), cannot start a packet."""
+    data = _silk(terminator=False)
+    for after in (struct.pack("<h", 0) + bytes(64), struct.pack("<h", 1025) + bytes(1100)):
+        hits = list(mediacarve.carve(_image([(4096, data + after)], filler=b"\x55"), kinds={"silk"}))
+        assert [(h.offset, h.length) for h in hits] == [(4096, len(data))], after[:2]
+
+
+def test_a_negative_count_other_than_minus_one_is_not_the_end_mark():
+    """The encoder ends a file with -1 and nothing else, so -2 is no end mark to
+    count; the file ends before it."""
+    data = _silk(terminator=False)
+    hits = list(mediacarve.carve(_image([(4096, data + struct.pack("<h", -2))], filler=b"\x55"),
+                                 kinds={"silk"}))
+    assert [(h.offset, h.length) for h in hits] == [(4096, len(data))]
+
+
+def test_a_silk_header_with_no_packet_is_not_a_file():
+    """The length floor would refuse such a short file too, so the walk is asked
+    directly."""
+    stream = _image([(4096, b"#!SILK_V3" + struct.pack("<h", -1) + bytes(200))])
+    assert list(mediacarve.carve(stream, kinds={"silk"})) == []
+    assert mediacarve._silk_length(stream, 4096, 1 << 20) is None
+
+
 # ------------------------------------------------------------------ matroska
 
 def _mkv_with_unknown_clusters():
