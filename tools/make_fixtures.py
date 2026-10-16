@@ -11,7 +11,7 @@ themselves need nothing but pytest.
     python tools/make_fixtures.py tests/fixtures/media
     python tools/make_fixtures.py tests/fixtures/media --only av
 
-``--only`` writes one group (stills, opencv, av, pcm, mp3, db or plist) and keeps the manifest entries
+``--only`` writes one group (stills, opencv, av, pcm, mp3, db, plist or zip) and keeps the manifest entries
 of the others, so adding a group does not re-encode the files already committed.
 The av group needs ffmpeg, the opencore-amr and vo-amrwbenc libraries for AMR
 (Homebrew has both), and sips from macOS for HEIC. The pcm group needs ffmpeg and
@@ -70,7 +70,52 @@ def write_media(out_dir, only=None):
         _write_db(out_dir, record)
     if only in (None, "plist"):
         _write_plist(out_dir, record)
+    if only in (None, "zip"):
+        _write_zip(out_dir, record)
     return made
+
+
+def _write_zip(out_dir, record):
+    """ZIP archives from Info-ZIP's zip, one streamed through stdin so its
+    entries carry data descriptors, and one from Apple's ditto."""
+    zip_, ditto = shutil.which("zip"), shutil.which("ditto")
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = os.path.join(tmp, "folder")
+        os.makedirs(folder)
+        # text only, so the archives hold no media of their own to report
+        with open(os.path.join(folder, "notes.txt"), "w") as fh:
+            fh.write("".join("line %d of a fixture\n" % i for i in range(200)))
+        with open(os.path.join(folder, "more.txt"), "w") as fh:
+            fh.write("".join("another %d\n" % (i * 7) for i in range(400)))
+        if zip_:
+            out = os.path.join(out_dir, "small.zip")
+            if os.path.exists(out):
+                os.remove(out)
+            subprocess.run((zip_, "-X", "-q", "-r", out, "."), cwd=folder, check=True,
+                           stdin=subprocess.DEVNULL)
+            record("small.zip", "zip")
+            # written to stdout, which cannot seek, so each entry carries a data
+            # descriptor
+            streamed = subprocess.run((zip_, "-X", "-q", "-", "notes.txt", "more.txt"), cwd=folder,
+                                      check=True, capture_output=True, stdin=subprocess.DEVNULL).stdout
+            with open(os.path.join(out_dir, "stream.zip"), "wb") as fh:
+                fh.write(streamed)
+            record("stream.zip", "zip")
+            # read from stdin, whose size zip cannot know, it writes a ZIP64 extra
+            # field and a data descriptor with 8-byte sizes
+            with open(os.path.join(folder, "notes.txt"), "rb") as src:
+                piped = subprocess.run((zip_, "-X", "-q", "-", "-"), input=src.read(),
+                                       check=True, capture_output=True).stdout
+            with open(os.path.join(out_dir, "stdin.zip"), "wb") as fh:
+                fh.write(piped)
+            record("stdin.zip", "zip")
+        else:
+            print("  zip absent: no Info-ZIP fixtures written", file=sys.stderr)
+        if ditto:
+            _run(ditto, "-c", "-k", "--norsrc", "--noextattr", folder, os.path.join(out_dir, "ditto.zip"))
+            record("ditto.zip", "zip")
+        else:
+            print("  ditto absent: no ditto fixture written", file=sys.stderr)
 
 
 def _write_plist(out_dir, record):
@@ -340,7 +385,7 @@ def _write_videos(out_dir, record):
 
 def main(argv):
     only = None
-    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "plist"):
+    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "plist", "zip"):
         only = argv[3]
     elif len(argv) != 2:
         print(__doc__)

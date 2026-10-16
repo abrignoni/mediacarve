@@ -167,6 +167,34 @@
       "ext": ".plist",
       "length": 3087,
       "sha256": "d71876679aae108dbf72e6f2e178c708b9cd61430704bf7a5491f10acc2e2b9f"
+    },
+    {
+      "name": "small.zip",
+      "kind": "zip",
+      "ext": ".zip",
+      "length": 1647,
+      "sha256": "2bffd6bc1786e28684c5c3718e29e8647c02fc7d54d9dfd348d5efa3d1c88479"
+    },
+    {
+      "name": "stream.zip",
+      "kind": "zip",
+      "ext": ".zip",
+      "length": 1679,
+      "sha256": "20f7ac3a46b1ec50031a15c09883d20a1b6c11a4281a83eff805ee677ddf398e"
+    },
+    {
+      "name": "stdin.zip",
+      "kind": "zip",
+      "ext": ".zip",
+      "length": 610,
+      "sha256": "d32054fd5f3545be71fbc9cd524d4690d274f5cbe128aa00b28e85c581d125e9"
+    },
+    {
+      "name": "ditto.zip",
+      "kind": "zip",
+      "ext": ".zip",
+      "length": 1735,
+      "sha256": "f02a1d8bff2b6d15e6457aa34ab61e390943dae257ca314d56bbfb518359f53d"
     }
   ]
 }

@@ -1,7 +1,8 @@
 # mediacarve
 
-Recover images, video, audio and, when asked, SQLite databases and binary plists
-from any stream of bytes, by signature. One file, pure
+Recover images, video, audio and, when asked, SQLite databases, binary plists and
+ZIP archives (APK, IPA, JAR, Office and OpenDocument files among them) from any
+stream of bytes, by signature. One file, pure
 Python, standard library only. No compiler, no network, nothing to install.
 
 ```python
@@ -70,7 +71,8 @@ mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic
 mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, wav, aiff, caf, mp3
 mediacarve carve disk.raw -o out/ -k databases   # sqlite
 mediacarve carve disk.raw -o out/ -k plists  # binary plists
-mediacarve carve disk.raw -o out/ -k all     # media, databases and plists
+mediacarve carve disk.raw -o out/ -k archives   # zip, apk, ipa, jar, docx...
+mediacarve carve disk.raw -o out/ -k all     # media, databases, plists, archives
 ```
 
 ## Lengths are parsed, not guessed
@@ -162,13 +164,16 @@ dated, path-anchored files.
 | `mp3` | MPEG audio Layer III, with ID3v2, APEv2 and ID3v1 tags | `.mp3` |
 | `sqlite` | SQLite 3 database (asked for with `-k databases` or `-k all`) | `.sqlite` |
 | `bplist` | binary property list, bplist00 (asked for with `-k plists` or `-k all`) | `.plist` |
+| `zip` | ZIP and the formats built on it (asked for with `-k archives` or `-k all`) | from the entry names: `.apk`, `.ipa`, `.jar`, `.docx`, `.xlsx`, `.pptx`, `.epub`, `.odt`, `.ods`, `.odp`, otherwise `.zip` |
 
 `-k images`, `-k video` and `-k audio` select the groups. Without `-k`, and with
 `kinds` left out of `carve()`, the media kinds are carved and nothing else, so a
 caller gets what it got before databases were added. `-k databases` adds SQLite,
-`-k plists` adds binary plists, and `-k all` carves everything. A database hides
+`-k plists` adds binary plists, `-k archives` adds ZIP, and `-k all` carves
+everything. A database hides
 nothing found inside it, and nothing hides a database. A plist hides the plists
-stored in it but no media, so asking for plists changes no media hit. The brand is read from
+stored in it, and a ZIP the ZIPs stored in it, but neither hides media, so asking
+for them changes no media hit. The brand is read from
 the `ftyp` box against the [MP4 registration authority's list](https://github.com/mp4ra/mp4ra.github.io/blob/35c6ffec3216d1d0d50671a68509ec4ddbf3c9b5/data/brands.csv).
 A brand only says what the writer declared: an audio-only file written with the
 generic `mp42` brand is reported as `mp4`, and 29 of 59 distinct `.m4a` files
@@ -451,6 +456,60 @@ width, the offsets inside the object data, a plist hiding no media, and a plist
 hiding the plists stored in it. The offset-width check and the lower bounds on
 the object count and table offset could not be shown alone, because the
 pointing-back and offset checks refuse the same trailers first.
+
+**ZIP.** From a local header the walk follows the entries (APPNOTE 6.3.10, 4.3.6
+to 4.3.16): it adds up their sizes, finds the data descriptor of an entry that
+left its sizes out, takes the descriptor only where its recorded size equals the
+distance from the start of the data, sizes it by the entry's ZIP64 field, and
+steps over zeros between entries. From wherever the entries stop, it searches
+for the end of central directory record and takes the archive only if that
+record points back to this header: its central directory starts at the
+recorded offset, counted from here, ends where the end record (or the ZIP64 one)
+begins, and holds as many entries as recorded. Whatever lies between the last
+entry and the directory is not read, because real archives put more there than
+the specification says. An extension is chosen from the names in the directory
+and from a stored first entry named `mimetype`, so it reflects what is inside,
+not what the file was called.
+
+On 7,167 ZIP-family files from public phone images (3,326 `.zip`, 2,912 `.apk`,
+717 `.jar`, 176 `.ipa` and others, 26 GiB), each laid between zeros and random
+bytes, 7,164 came back at exactly their size, in 158 seconds. The other 3 are
+the ones Python's `zipfile` cannot open either. That run shaped the walk:
+
+- 73 APKs leave bytes between entries: in 70 they are zeros, up to 4,057
+  bytes, and in 3 they are not.
+- Zeros before the APK signing block, where all zero, run up to 4,094 bytes.
+- Some APKs carry a signing block followed by more entries, a stray central
+  directory header, or an entry the directory does not list followed by about
+  15 KB that belongs to no entry. So the end record is searched for rather
+  than reached by reading every record.
+- Info-ZIP writing to stdout from stdin gives each entry a ZIP64 field and an
+  8-byte descriptor, whose low half reads as the same 4-byte size, so the
+  descriptor's width comes from the entry, not from a guess.
+- A walk that fails marks the headers it passed, so an archive whose walk fails
+  is not walked again from every entry.
+
+The same run found that a signature whose kinds were not asked for was still
+measured, and an MP3 hit that is then dropped covers nothing: one 33.8 MB APK
+carved for ZIPs only cost 89,932 MP3 walks and 25 seconds. Such signatures are no
+longer measured; it now takes a third of a second.
+
+On the six volumes every ZIP hit (14, 14, 23, 163, 119 and 94) opens in
+`zipfile` with every CRC good. On the two Takeout volumes all 14 ZIP-family files
+in each file table come back at exactly their size and nothing else is reported;
+PhotoRec finds 13 of them. On the two Android ext4 volumes every ZIP file that is
+contiguous on disk comes back at exactly its size; the 51 and 43 that are
+fragmented, in 2 to 99 pieces, give no hit. A run without `-k` is the same, hit
+for hit, as 0.7.0, and asking for archives changes no media hit.
+
+Each ZIP rule was broken in turn and made its own test fail: archives only when
+asked for, a ZIP hiding the ZIPs in it but no media, the end record pointing
+back, the entry count, the failed-walk cache, the extension from names and from
+`mimetype`, and not measuring unasked signatures. The descriptor's distance and
+width and the zero skip only make the walk reach the directory without reading
+every byte; the end record decides, so their test is that the walk passes every
+entry. That the directory ends where the end record begins could not be shown
+alone, because breaking it breaks the pointing-back check first.
 
 ## Tests
 

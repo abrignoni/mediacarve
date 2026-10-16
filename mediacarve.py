@@ -49,7 +49,7 @@ import zipfile
 import zlib
 from typing import NamedTuple
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # How much to read at a time while scanning, and how much to carry over so a
 # signature straddling two blocks is still found.
@@ -78,6 +78,7 @@ DEFAULT_CAPS = {
     "mp3": 1 << 30,
     "sqlite": 4 << 30,
     "bplist": 32 << 20,
+    "zip": 4 << 30,
 }
 _ABSOLUTE_CAP = 4 << 30
 
@@ -91,6 +92,7 @@ MIN_LENGTHS = {
     "avi": 1024, "mp4": 1024, "heic": 512,
     "m4a": 1024, "ogg": 128, "ogv": 1024, "amr": 256,
     "wav": 64, "aiff": 64, "caf": 64, "mp3": 128, "sqlite": 512, "bplist": 41,
+    "zip": 22,
 }
 
 # The conventional extension for each kind. ISO-BMFF, Ogg and AMR refine it from
@@ -100,7 +102,7 @@ EXTENSIONS = {
     "avi": ".avi", "mp4": ".mp4", "heic": ".heic",
     "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "amr": ".amr",
     "wav": ".wav", "aiff": ".aiff", "caf": ".caf", "mp3": ".mp3",
-    "sqlite": ".sqlite", "bplist": ".plist",
+    "sqlite": ".sqlite", "bplist": ".plist", "zip": ".zip",
 }
 
 IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic"})
@@ -109,7 +111,8 @@ AUDIO_KINDS = frozenset({"m4a", "ogg", "amr", "wav", "aiff", "caf", "mp3"})
 MEDIA_KINDS = IMAGE_KINDS | VIDEO_KINDS | AUDIO_KINDS
 DATABASE_KINDS = frozenset({"sqlite"})
 PLIST_KINDS = frozenset({"bplist"})
-ALL_KINDS = MEDIA_KINDS | DATABASE_KINDS | PLIST_KINDS
+ARCHIVE_KINDS = frozenset({"zip"})
+ALL_KINDS = MEDIA_KINDS | DATABASE_KINDS | PLIST_KINDS | ARCHIVE_KINDS
 
 # What a scan looks for when no kinds are given. Media only, so a caller that
 # has always passed nothing keeps getting what it got before databases were
@@ -150,6 +153,7 @@ _SCAN = re.compile(
     b"|caff\x00\x01\x00\x00"      # CAF version 1, flags 0
     b"|SQLite format 3\x00"        # SQLite database header
     b"|bplist00"                  # binary property list
+    b"|PK\x03\x04"                # ZIP local file header
     b"|ID3[\x02-\x04]\x00"         # ID3v2 tag, versions 2.2 to 2.4
     b"|\xff[\xe2\xe3\xf2\xf3\xfa\xfb]",  # MPEG audio Layer III frame sync
     re.DOTALL)
@@ -850,6 +854,239 @@ def _bplist_length(stream, offset, cap):
     return None
 
 
+# A data descriptor, or the record after one written without its signature.
+_ZIP_AFTER_DATA = re.compile(b"PK\x07\x08|PK\x03\x04|PK\x01\x02", re.DOTALL)
+
+
+def _zip_find_descriptor(stream, data_start, end, zip64=False):
+    """Where an entry's data ends, for an entry that left its sizes to a data
+    descriptor. Returns the position after the descriptor, or None.
+
+    APPNOTE 6.3.10 4.3.9: the descriptor follows the data and holds the CRC and
+    the compressed and uncompressed sizes behind an optional signature PK 07 08.
+    The sizes are 8 bytes each when the entry has a ZIP64 extra field (4.3.9.2)
+    and 4 otherwise; ``zip64`` says which, because the low half of an 8-byte
+    size reads as the same 4-byte number. A candidate is taken only if the
+    compressed size it records is exactly the distance from the start of the
+    data, so a ZIP stored inside the entry cannot pass for its end.
+    """
+    width = 8 if zip64 else 4
+    size_fmt = "<Q" if zip64 else "<I"
+    pos = data_start
+    window = 4096                                 # most entries are small: start
+    while pos < end:                              # small and grow to 1 MiB
+        want = min(window, end - pos)
+        buf = _read_at(stream, pos, want + 24)
+        if len(buf) < 16:
+            return None
+        for m in _ZIP_AFTER_DATA.finditer(buf, 0, len(buf) - 15):
+            at = pos + m.start()
+            if m.group() == b"PK\x07\x08":
+                size = buf[m.start() + 8:m.start() + 8 + width]
+                if len(size) == width and struct.unpack(size_fmt, size)[0] == at - data_start:
+                    return at + 8 + 2 * width
+            elif at - 4 - 2 * width >= data_start:    # a descriptor with no signature
+                start = at - 4 - 2 * width
+                size = _read_at(stream, start + 4, width)
+                if struct.unpack(size_fmt, size)[0] == start - data_start:
+                    return at
+        if len(buf) < want + 24:
+            return None
+        pos += want
+        window = min(window * 2, 1 << 20)
+    return None
+
+
+def _zip64_extra(extra):
+    """The data of a local header's ZIP64 extended information field (tag 1,
+    APPNOTE 4.5.3), or None when it has none."""
+    i = 0
+    while i + 4 <= len(extra):
+        tag, size = struct.unpack("<HH", extra[i:i + 4])
+        if tag == 1:
+            return extra[i + 4:i + 4 + size]
+        i += 4 + size
+    return None
+
+
+def _zip_ext(names, mimetype):
+    """An extension from the names in the central directory, and from the first
+    entry's content when it is a stored file named "mimetype"."""
+    if mimetype:
+        for prefix, ext in ((b"application/epub+zip", ".epub"),
+                            (b"application/vnd.oasis.opendocument.text", ".odt"),
+                            (b"application/vnd.oasis.opendocument.spreadsheet", ".ods"),
+                            (b"application/vnd.oasis.opendocument.presentation", ".odp")):
+            if mimetype.startswith(prefix):
+                return ext
+    if "AndroidManifest.xml" in names:
+        return ".apk"
+    if any(n.startswith("Payload/") and ".app/" in n for n in names):
+        return ".ipa"
+    if "[Content_Types].xml" in names:
+        for folder, ext in (("word/", ".docx"), ("xl/", ".xlsx"), ("ppt/", ".pptx")):
+            if any(n.startswith(folder) for n in names):
+                return ext
+    if "META-INF/MANIFEST.MF" in names:
+        return ".jar"
+    return ".zip"
+
+
+def _zip_after_zeros(stream, pos):
+    """The position of the next ZIP record past a run of zeros at ``pos``.
+
+    Writers that align entries (uncompressed native libraries aligned to a page,
+    say) leave zeros between one entry's data and the next local header.
+    Measured: 70 APKs from public phone images had such gaps, up to 4,057 bytes.
+    Up to 64 KiB of zeros is stepped over, and only to reach a local header or
+    the central directory.
+    """
+    buf = _read_at(stream, pos, 1 << 16)
+    skip = len(buf) - len(buf.lstrip(b"\x00"))
+    if not skip or buf[skip:skip + 4] not in (b"PK\x03\x04", b"PK\x01\x02"):
+        return None
+    return pos + skip
+
+
+def _zip_length(stream, offset, cap, dead=None):
+    """Walk a ZIP from its first local header to the end of its central directory.
+
+    The records are APPNOTE 6.3.10's (4.3.6 to 4.3.16): local headers and their
+    data, an entry's data descriptor when bit 3 of its flags left the sizes out
+    of the local header, then the central directory, an optional ZIP64 end
+    record and locator, and the end of central directory record with its
+    comment. The local entries are walked to find where they end; from there
+    the end record is searched for, and taken only if it points back to this
+    header: its central directory starts at the recorded offset, counted from
+    here, runs to the end record (or the ZIP64 one), and holds as many entries
+    as recorded. What lies between the last entry and the directory is not
+    read, because real archives put more there than the specification says:
+    an APK signing block (source.android.com, APK Signature Scheme v2), zeros
+    before it, more entries after it, and entries the directory does not list.
+
+    Measured on 7,167 ZIP-family files from public phone images (3,326 .zip,
+    2,912 .apk, 717 .jar, 176 .ipa and others): in every one with an end record
+    it ends the file, 2,938 carry an APK signing block, and 2,356 have entries
+    whose sizes are in a data descriptor; 665,013 of those 680,264 entries put a
+    size of 0 in the local header.
+
+    ``dead`` is a set the scan keeps. A walk that fails marks every local header
+    it passed through as one no other walk needs to start from, because each
+    would take the same path to the same end; a header an end record points
+    back to is left open. Without it an archive whose walk fails is walked
+    again from every one of its entries.
+    """
+    end = offset + cap
+    visited, starts = [], set()
+    result = _zip_walk(stream, offset, end, visited, starts)
+    if result is None:
+        if dead is not None:
+            dead.update(p for p in visited if p not in starts)
+        return None
+    return result
+
+
+# How far past the last local entry the end record is looked for: the central
+# directory, and whatever a writer put before it, has to fit in this.
+_ZIP_TAIL = 64 << 20
+
+
+def _zip_walk(stream, offset, end, visited, starts):
+    """The walk _zip_length describes. ``starts`` collects the headers that
+    end records found on the way point back to, when they are not this one."""
+    pos = offset
+    mimetype = None
+    first = True
+    while pos < end:                              # local entries
+        head = _read_at(stream, pos, 30)
+        if len(head) < 30 or head[:4] != b"PK\x03\x04":
+            after = None if first else _zip_after_zeros(stream, pos)
+            if after is None:
+                break
+            pos = after
+            continue
+        visited.append(pos)
+        flags, method = struct.unpack("<HH", head[6:10])
+        csize = struct.unpack("<I", head[18:22])[0]
+        nlen, xlen = struct.unpack("<HH", head[26:30])
+        data_start = pos + 30 + nlen + xlen
+        if first:
+            if _read_at(stream, pos + 30, nlen) == b"mimetype" and method == 0 and 0 < csize < 128:
+                mimetype = _read_at(stream, data_start, csize)
+            first = False
+        if flags & 8:
+            zip64 = _zip64_extra(_read_at(stream, pos + 30 + nlen, xlen)) is not None
+            nxt = _zip_find_descriptor(stream, data_start, end, zip64)
+            if nxt is None:
+                break
+            pos = nxt
+        else:
+            if csize == 0xFFFFFFFF:               # ZIP64: the size is in the extra field
+                field = _zip64_extra(_read_at(stream, pos + 30 + nlen, xlen))
+                if field is None or len(field) < 16:
+                    break
+                csize = struct.unpack("<Q", field[8:16])[0]
+            pos = data_start + csize
+    if not visited:
+        return None
+    limit = min(end, pos + _ZIP_TAIL)
+    at = max(pos, visited[-1] + 30)
+    while at < limit:                             # the end record that points back
+        buf = _read_at(stream, at, min(1 << 20, limit - at) + 21)
+        if len(buf) < 22:
+            return None
+        i = buf.find(b"PK\x05\x06")
+        while 0 <= i <= len(buf) - 22:            # a whole record fits in the buffer
+            got = _zip_end(stream, offset, at + i, end, starts)
+            if got:
+                length, names = got
+                return length, "parsed", "zip", _zip_ext(names, mimetype)
+            i = buf.find(b"PK\x05\x06", i + 1)
+        if len(buf) < (1 << 20) + 21:
+            return None
+        at += 1 << 20
+    return None
+
+
+def _zip_end(stream, offset, eocd_at, end, starts):
+    """(length, names) when the end record at ``eocd_at`` points back to
+    ``offset``, or None. A record that points somewhere else adds that header
+    to ``starts``."""
+    eocd = _read_at(stream, eocd_at, 22)
+    n_total, size, cd_off, clen = struct.unpack("<HIIH", eocd[10:22])
+    dir_end = eocd_at
+    if 0xFFFFFFFF in (size, cd_off) or n_total == 0xFFFF:
+        loc = _read_at(stream, eocd_at - 20, 20)
+        if loc[:4] != b"PK\x06\x07":
+            return None
+        rec_at = offset + struct.unpack("<Q", loc[8:16])[0]
+        rec = _read_at(stream, rec_at, 56)
+        if rec[:4] != b"PK\x06\x06" or len(rec) < 56:
+            return None
+        n_total, size, cd_off = struct.unpack("<QQQ", rec[32:56])
+        dir_end = rec_at
+    cd_start = dir_end - size
+    if cd_start - cd_off != offset:
+        if cd_start - cd_off >= 0:
+            starts.add(cd_start - cd_off)
+        return None
+    names, pos, entries = set(), cd_start, 0
+    while pos < dir_end:
+        head = _read_at(stream, pos, 46)
+        if head[:4] != b"PK\x01\x02" or len(head) < 46:
+            return None
+        nlen, xlen, clen2 = struct.unpack("<HHH", head[28:34])
+        if len(names) < 4096:
+            names.add(_read_at(stream, pos + 46, nlen).decode("utf-8", "replace"))
+        pos += 46 + nlen + xlen + clen2
+        entries += 1
+    if pos != dir_end or entries != n_total or not entries:
+        return None
+    if eocd_at + 22 + clen > end:
+        return None
+    return eocd_at + 22 + clen - offset, names
+
+
 # Ogg pages carry a CRC-32 with the generator polynomial 0x04c11db7 (RFC 3533,
 # section 6), computed MSB first with a zero start and no final inversion, over
 # the page with its CRC field zeroed. zlib computes the same polynomial LSB
@@ -1013,7 +1250,7 @@ def _amr_length(stream, offset, cap):
 
 # ------------------------------------------------------------------ scanning
 
-def _measure(stream, offset, kind, caps):
+def _measure(stream, offset, kind, caps, dead=None):
     """Return a Candidate for a header at ``offset``, or None if it is not one."""
     if kind == "jpeg":
         got = _jpeg_length(stream, offset, _cap(caps, kind))
@@ -1039,6 +1276,8 @@ def _measure(stream, offset, kind, caps):
         got = _sqlite_length(stream, offset, caps)
     elif kind == "bplist":
         got = _bplist_length(stream, offset, _cap(caps, kind))
+    elif kind == "zip":
+        got = _zip_length(stream, offset, _cap(caps, kind), dead)
     else:
         return None
     if got is None:
@@ -1055,12 +1294,25 @@ def _measure(stream, offset, kind, caps):
     return Candidate(offset, length, kind, ext or EXTENSIONS.get(kind, ".bin"), bounded)
 
 
+# The kinds a signature can turn out to be. A signature whose kinds were not asked
+# for is not measured: its hit would be dropped, and one never kept can cover
+# nothing, so every MP3 frame sync inside one long MP3 stream was measured to
+# the stream's end. Measured on one 33.8 MB APK carved for ZIPs only: 89,932
+# MP3 walks and 25 seconds, against a third of a second without them.
+_SIGNATURE_KINDS = {
+    "jpeg": {"jpeg"}, "png": {"png"}, "gif": {"gif"}, "riff": {"avi", "webp", "wav"},
+    "bmff": {"mp4", "heic", "m4a"}, "ogg": {"ogg", "ogv"}, "amr": {"amr"},
+    "iff": {"aiff"}, "caf": {"caf"}, "mp3": {"mp3"}, "sqlite": {"sqlite"},
+    "bplist": {"bplist"}, "zip": {"zip"},
+}
+
+
 def _coverage_group(kind):
     """Which hits a hit of this kind can hide, and be hidden by.
 
     Media hide media: an EXIF thumbnail inside a JPEG is not a second file. A
-    plist hides the plists stored in it, but no media, so asking for plists
-    changes no media hit. A database hides nothing and nothing hides it, because
+    plist hides the plists stored in it, and a ZIP the ZIPs stored in it, but
+    neither hides media, so asking for them changes no media hit. A database hides nothing and nothing hides it, because
     a blob is spread over the database's pages and its own sizes can claim the
     next file.
     """
@@ -1068,6 +1320,8 @@ def _coverage_group(kind):
         return None
     if kind in ("bplist",):
         return "bplist"
+    if kind in ("zip",):
+        return "zip"
     return "media"
 
 
@@ -1110,7 +1364,8 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
         end = size
     limit = end if clip else size
     pos = start
-    covered = {"media": start, "bplist": start}    # how far each group's hits reach
+    covered = {"media": start, "bplist": start, "zip": start}   # each group's reach
+    zip_dead = set()                              # local headers a failed walk passed
     while pos < end:
         buf = _read_at(stream, pos, min(BLOCK, end - pos))
         if not buf:
@@ -1141,18 +1396,24 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                 if "bplist" not in kinds:
                     continue
                 kind = "bplist"
+            elif sig == b"PK\x03\x04":
+                if "zip" not in kinds:
+                    continue
+                kind = "zip"
             elif sig.startswith(b"\xff\xd8"):
                 kind = "jpeg"
             elif sig.startswith(b"\x89PNG"):
                 kind = "png"
             else:
                 kind = "gif"
-            if at < start:
-                continue
+            if at < start or kinds.isdisjoint(_SIGNATURE_KINDS[kind]):
+                continue                          # nothing asked for can come of it
             group = _coverage_group(kind)
             if not nested and group and at < covered[group]:
                 continue
-            hit = _measure(stream, at, kind, caps)
+            if kind == "zip" and at in zip_dead:
+                continue
+            hit = _measure(stream, at, kind, caps, zip_dead)
             if hit is None:
                 continue
             if hit.end > limit:
@@ -1260,6 +1521,8 @@ def _kinds_arg(value):
             wanted |= set(DATABASE_KINDS)
         elif part in ("plists", "plist"):
             wanted |= set(PLIST_KINDS)
+        elif part in ("archives", "archive"):
+            wanted |= set(ARCHIVE_KINDS)
         elif part == "images":
             wanted |= set(IMAGE_KINDS)
         elif part in ("video", "videos"):
@@ -1322,7 +1585,8 @@ def main(argv=None):
     common.add_argument("image", help="raw image, or an .E01 when ewfprobe is present")
     common.add_argument("-k", "--kinds", default=None,
                         help="what to carve: media (the default), images, video, "
-                             "audio, databases, plists, all, or a comma separated "
+                             "audio, databases, plists, archives, all, or a comma "
+                             "separated "
                              "list such as jpeg,png,sqlite")
     common.add_argument("--nested", action="store_true",
                         help="also report files inside another file, such as "
