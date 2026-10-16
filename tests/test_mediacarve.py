@@ -736,6 +736,77 @@ def test_page_one_copied_into_a_log_is_not_a_database():
 
 
 
+# ---------------------------------------------------------- sqlite-encrypted
+
+_ENCRYPTED = ("small-encrypted.sqlite", "small-encrypted-v3.sqlite")
+
+
+def _random_image(pieces):
+    size = max(off + len(data) for off, data in pieces) + 4096
+    blob = bytearray(random.Random(5).randbytes(size))
+    for off, data in pieces:
+        blob[off:off + len(data)] = data
+    return io.BytesIO(bytes(blob))
+
+
+@pytest.mark.parametrize("name", _ENCRYPTED)
+@pytest.mark.parametrize("filler", [b"\x00", None])
+def test_a_database_encrypted_after_its_header_is_found_at_its_size(name, filler):
+    """Written by the SQLCipher shell with a 32-byte plain header, SQLCipher 4's
+    settings (80-byte reserve) and 3's (48). The sqlite3 library will not open
+    either, and the length is the page count as stored."""
+    db = _load(name)
+    pieces = [(4096, db), (4096 + len(db) + 8192, _load("small.sqlite"))]
+    stream = _image(pieces) if filler else _random_image(pieces)
+    for kinds in ({"sqlite-encrypted"}, mediacarve._kinds_arg("databases"), mediacarve.ALL_KINDS):
+        hits = [(h.offset, h.length, h.kind, h.ext, h.bounded) for h in mediacarve.carve(stream, kinds=kinds)]
+        assert (4096, len(db), "sqlite-encrypted", ".sqlite", "header") in hits
+
+
+def test_encrypted_and_plain_databases_are_asked_for_apart():
+    enc, plain = _load("small-encrypted.sqlite"), _load("small.sqlite")
+    stream = _image([(4096, enc), (65536, plain)])
+    assert [h.kind for h in mediacarve.carve(stream, kinds={"sqlite"})] == ["sqlite"]
+    assert [h.kind for h in mediacarve.carve(stream, kinds={"sqlite-encrypted"})] == ["sqlite-encrypted"]
+    assert [h.kind for h in mediacarve.carve(stream)] == []
+
+
+def test_an_encrypted_database_needs_a_cipher_reserve():
+    """The reserve is the IV plus the HMAC rounded up to the AES block, so it is
+    a non-zero multiple of 16 (sqlcipher.c, sqlcipher_codec_ctx_reserve_setup)."""
+    db = bytearray(_load("small-encrypted.sqlite"))
+    for reserve in (0, 12, 81):
+        db[20] = reserve
+        assert list(mediacarve.carve(_image([(4096, bytes(db))]), kinds={"sqlite-encrypted"})) == [], reserve
+
+
+def test_an_encrypted_database_still_needs_its_plain_header():
+    """The checks on bytes 16 to 31 still apply: a page count and a page size."""
+    db = bytearray(_load("small-encrypted.sqlite"))
+    zero = bytearray(db)
+    zero[28:32] = bytes(4)
+    odd = bytearray(db)
+    odd[16:18] = b"\x03\x00"
+    for bad in (zero, odd):
+        assert list(mediacarve.carve(_image([(4096, bytes(bad))]), kinds=mediacarve.ALL_KINDS)) == []
+
+
+def test_a_plain_database_is_never_called_encrypted():
+    """Bytes 72 to 91 are zero in a plain database, so one that fails a check
+    after byte 32 is refused, as before, even with a reserve SQLCipher could use."""
+    db = bytearray(_db())
+    db[20] = 80
+    db[92:96] = (struct.unpack(">I", db[92:96])[0] + 1).to_bytes(4, "big")
+    assert list(mediacarve.carve(_image([(4096, bytes(db))]), kinds=mediacarve.ALL_KINDS)) == []
+
+
+def test_an_encrypted_page_one_copied_into_a_log_is_not_a_database():
+    db = _load("small-encrypted.sqlite")
+    wal_frame = struct.pack(">IIIIII", 1, 0, 0x1234, 0x5678, 0x9ABC, 0xDEF0)
+    stream = _image([(4096 - len(wal_frame), wal_frame + db)])
+    assert list(mediacarve.carve(stream, kinds={"sqlite-encrypted"})) == []
+
+
 # -------------------------------------------------------------------- bplist
 
 def _plist():

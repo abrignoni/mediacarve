@@ -49,7 +49,7 @@ import zipfile
 import zlib
 from typing import NamedTuple
 
-__version__ = "0.9.1"
+__version__ = "0.10.0"
 
 # How much to read at a time while scanning, and how much to carry over so a
 # signature straddling two blocks is still found.
@@ -77,6 +77,7 @@ DEFAULT_CAPS = {
     "caf": 4 << 30,
     "mp3": 1 << 30,
     "sqlite": 4 << 30,
+    "sqlite-encrypted": 4 << 30,
     "bplist": 32 << 20,
     "zip": 4 << 30,
     "pdf": 1 << 30,
@@ -92,7 +93,8 @@ MIN_LENGTHS = {
     "jpeg": 128, "png": 57, "gif": 64, "webp": 64,
     "avi": 1024, "mp4": 1024, "heic": 512,
     "m4a": 1024, "ogg": 128, "ogv": 1024, "amr": 256,
-    "wav": 64, "aiff": 64, "caf": 64, "mp3": 128, "sqlite": 512, "bplist": 41,
+    "wav": 64, "aiff": 64, "caf": 64, "mp3": 128, "sqlite": 512,
+    "sqlite-encrypted": 512, "bplist": 41,
     "zip": 22, "pdf": 64,
 }
 
@@ -103,7 +105,7 @@ EXTENSIONS = {
     "avi": ".avi", "mp4": ".mp4", "heic": ".heic",
     "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "amr": ".amr",
     "wav": ".wav", "aiff": ".aiff", "caf": ".caf", "mp3": ".mp3",
-    "sqlite": ".sqlite", "bplist": ".plist", "zip": ".zip",
+    "sqlite": ".sqlite", "sqlite-encrypted": ".sqlite", "bplist": ".plist", "zip": ".zip",
     "pdf": ".pdf",
 }
 
@@ -111,7 +113,7 @@ IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic"})
 VIDEO_KINDS = frozenset({"avi", "mp4", "ogv"})
 AUDIO_KINDS = frozenset({"m4a", "ogg", "amr", "wav", "aiff", "caf", "mp3"})
 MEDIA_KINDS = IMAGE_KINDS | VIDEO_KINDS | AUDIO_KINDS
-DATABASE_KINDS = frozenset({"sqlite"})
+DATABASE_KINDS = frozenset({"sqlite", "sqlite-encrypted"})
 PLIST_KINDS = frozenset({"bplist"})
 ARCHIVE_KINDS = frozenset({"zip"})
 DOCUMENT_KINDS = frozenset({"pdf"})
@@ -766,7 +768,7 @@ def _sqlite_length(stream, offset, caps):
     Measured on 8,700 databases from public phone images: in 8,669 the page
     count is valid and times the page size is exactly the file's size. 15 have
     no page count. 9 keep only their first 32 bytes in plain text and the rest
-    encrypted, so the checks after byte 32 fail; they are not reported.
+    encrypted; they are the sqlite-encrypted kind (_sqlite_encrypted).
 
     A write-ahead log and a rollback journal keep copies of a database's pages,
     page 1 and its header among them, behind a frame header that opens with the
@@ -792,15 +794,46 @@ def _sqlite_length(stream, offset, caps):
     if head[18] not in (1, 2) or head[19] not in (1, 2) or head[21:24] != b"\x40\x20\x20":
         return None
     counter, pages = struct.unpack(">II", head[24:32])
-    schema, encoding = struct.unpack(">I", head[44:48])[0], struct.unpack(">I", head[56:60])[0]
-    if schema > 4 or encoding > 3 or head[72:92] != bytes(20):
-        return None
-    if not pages or counter != struct.unpack(">I", head[92:96])[0]:
+    if not pages:
         return None
     length = pages * page
+    if head[72:92] != bytes(20):
+        return _sqlite_encrypted(head, length, caps)
+    schema, encoding = struct.unpack(">I", head[44:48])[0], struct.unpack(">I", head[56:60])[0]
+    if schema > 4 or encoding > 3 or counter != struct.unpack(">I", head[92:96])[0]:
+        return None
     if length > _cap(caps, "sqlite"):
         return None
     return length, "header", "sqlite", ".sqlite"
+
+
+def _sqlite_encrypted(head, length, caps):
+    """A database whose header is plain only up to byte 32, the rest encrypted.
+
+    SQLCipher can leave the start of page 1 unencrypted: cipher_plaintext_header_size
+    must be a multiple of the cipher's block size (sqlcipher.c,
+    sqlcipher_codec_ctx_set_plaintext_header_size, v4.6.1), and every page keeps a
+    reserve of the IV plus the HMAC, rounded up to the block size
+    (sqlcipher_codec_ctx_reserve_setup): with AES-256 that is 16, 48 or 80 bytes,
+    80 with SQLCipher 4's default HMAC-SHA512. With a 32-byte plain header, bytes 16
+    to 31 are SQLite's own, so the page size and page count can be read, but the
+    version-valid-for number at 92 that vouches for the count is encrypted. So the
+    length is the page count as stored, and this kind says so.
+
+    Taken only when bytes 72 to 91, which SQLite keeps zero, are not zero: a plain
+    database there is refused, as before, and not reported as encrypted. The
+    reserve must be a non-zero multiple of 16, the AES block size.
+
+    Measured on 8,700 databases from public phone images: 9 are like this, all
+    from iOS, all with an 80-byte reserve, and in all 9 the page count times the
+    page size is exactly the file's size.
+    """
+    reserve = head[20]
+    if reserve < 16 or reserve % 16:
+        return None
+    if length > _cap(caps, "sqlite-encrypted"):
+        return None
+    return length, "header", "sqlite-encrypted", ".sqlite"
 
 
 # A binary plist trailer as it opens: five unused bytes and the sort version,
@@ -1384,7 +1417,8 @@ def _measure(stream, offset, kind, caps, dead=None):
 _SIGNATURE_KINDS = {
     "jpeg": {"jpeg"}, "png": {"png"}, "gif": {"gif"}, "riff": {"avi", "webp", "wav"},
     "bmff": {"mp4", "heic", "m4a"}, "ogg": {"ogg", "ogv"}, "amr": {"amr"},
-    "iff": {"aiff"}, "caf": {"caf"}, "mp3": {"mp3"}, "sqlite": {"sqlite"},
+    "iff": {"aiff"}, "caf": {"caf"}, "mp3": {"mp3"},
+    "sqlite": {"sqlite", "sqlite-encrypted"},
     "bplist": {"bplist"}, "zip": {"zip"}, "pdf": {"pdf"},
 }
 
@@ -1398,7 +1432,7 @@ def _coverage_group(kind):
     a blob is spread over the database's pages and its own sizes can claim the
     next file.
     """
-    if kind in ("sqlite",):
+    if kind in ("sqlite", "sqlite-encrypted"):
         return None
     if kind in ("bplist",):
         return "bplist"
@@ -1473,7 +1507,7 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
             elif sig.startswith(b"ID3") or len(sig) == 2:
                 kind = "mp3"
             elif sig.startswith(b"SQLite"):
-                if "sqlite" not in kinds:
+                if kinds.isdisjoint(_SIGNATURE_KINDS["sqlite"]):
                     continue
                 kind = "sqlite"
             elif sig == b"bplist00":

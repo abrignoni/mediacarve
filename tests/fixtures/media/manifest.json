@@ -216,6 +216,20 @@
       "ext": ".pdf",
       "length": 1728,
       "sha256": "3d910d6bd4eecd13308afaf1703d3daeab5e76d27518ede2e5c0f89d35ef23b5"
+    },
+    {
+      "name": "small-encrypted.sqlite",
+      "kind": "sqlite-encrypted",
+      "ext": ".sqlite",
+      "length": 49152,
+      "sha256": "f9ba692ccc48d2b9dd63eab1ea5087ea828870d348eec67f9a114bde4a52c0b4"
+    },
+    {
+      "name": "small-encrypted-v3.sqlite",
+      "kind": "sqlite-encrypted",
+      "ext": ".sqlite",
+      "length": 47104,
+      "sha256": "3e9f4a31c0e4d7779018ad0a98a2492422513ae07c921d211b34ccf334eccf21"
     }
   ]
 }

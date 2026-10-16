@@ -3,6 +3,7 @@
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -41,7 +42,7 @@ def test_cli_reentry_prints_what_the_command_line_prints(image):
     through = run(GUI, "--cli", "list", "-q", "-v", str(image))
     assert direct.returncode == through.returncode == 0
     assert through.stdout == direct.stdout
-    assert f"total  {len(MEDIA):>8,}" in through.stdout
+    assert re.search(rf"^  total +{len(MEDIA):,}  ", through.stdout, re.M)
 
 
 @pytest.mark.parametrize("name", ["out", "out.zip"])

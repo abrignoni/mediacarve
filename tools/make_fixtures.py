@@ -11,7 +11,8 @@ themselves need nothing but pytest.
     python tools/make_fixtures.py tests/fixtures/media
     python tools/make_fixtures.py tests/fixtures/media --only av
 
-``--only`` writes one group (stills, opencv, av, pcm, mp3, db, plist, zip or pdf) and keeps the manifest entries
+``--only`` writes one group (stills, opencv, av, pcm, mp3, db, sqlcipher, plist, zip
+or pdf) and keeps the manifest entries
 of the others, so adding a group does not re-encode the files already committed.
 The av group needs ffmpeg, the opencore-amr and vo-amrwbenc libraries for AMR
 (Homebrew has both), and sips from macOS for HEIC. The pcm group needs ffmpeg and
@@ -68,6 +69,8 @@ def write_media(out_dir, only=None):
         _write_mp3(out_dir, record)
     if only in (None, "db"):
         _write_db(out_dir, record)
+    if only in (None, "sqlcipher"):
+        _write_sqlcipher(out_dir, record)
     if only in (None, "plist"):
         _write_plist(out_dir, record)
     if only in (None, "zip"):
@@ -185,6 +188,33 @@ def _write_db(out_dir, record):
     con.commit()
     con.close()
     record("small.sqlite", "sqlite")
+
+
+def _write_sqlcipher(out_dir, record):
+    """Databases written by the SQLCipher shell, encrypted after a 32-byte plain
+    header (cipher_plaintext_header_size), one with SQLCipher 4's settings and one
+    with SQLCipher 3's. The 3 settings are made the default before the key: set
+    after it, the database keeps the reserve SQLCipher 4 gave it (80 bytes, not
+    3's 48). A plain header needs the salt given, since its usual place, the
+    first 16 bytes, holds the SQLite magic."""
+    sqlcipher = shutil.which("sqlcipher")
+    if not sqlcipher:
+        print("  sqlcipher absent: no encrypted database fixtures written", file=sys.stderr)
+        return
+    for name, compat in (("small-encrypted.sqlite", ""), ("small-encrypted-v3.sqlite", "PRAGMA cipher_default_compatibility = 3;\n")):
+        path = os.path.join(out_dir, name)
+        if os.path.exists(path):
+            os.remove(path)
+        script = (compat + "PRAGMA key = 'fixture-key';\n" +
+                  "PRAGMA cipher_plaintext_header_size = 32;\n"
+                  "PRAGMA cipher_salt = \"x'00112233445566778899aabbccddeeff'\";\n"
+                  "PRAGMA journal_mode = DELETE;\n"
+                  "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);\n"
+                  "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400)\n"
+                  "  INSERT INTO notes (body) SELECT 'note ' || i || ' ' || printf('%080d', i * 7919) FROM n;\n")
+        subprocess.run([sqlcipher, path], input=script.encode(), check=True,
+                       stdout=subprocess.DEVNULL)
+        record(name, "sqlite-encrypted", ".sqlite")
 
 
 def _write_mp3(out_dir, record):
@@ -418,7 +448,7 @@ def _write_videos(out_dir, record):
 
 def main(argv):
     only = None
-    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "plist", "zip", "pdf"):
+    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "sqlcipher", "plist", "zip", "pdf"):
         only = argv[3]
     elif len(argv) != 2:
         print(__doc__)
