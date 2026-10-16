@@ -162,6 +162,7 @@ dated, path-anchored files.
 | `m4a` | ISO-BMFF with an iTunes audio brand | `.m4a`, `.m4b`, `.m4p` |
 | `ogg` | Ogg audio | from the codec: `.opus`, `.spx`, `.oga` (FLAC), otherwise `.ogg` |
 | `ogv` | Ogg with a Theora stream | `.ogv` |
+| `mkv` | Matroska and WebM | from the DocType: `.webm`, otherwise `.mkv` |
 | `amr` | AMR and AMR-WB storage files | `.amr`, `.awb` |
 | `wav` | WAV (RIFF WAVE) | `.wav` |
 | `aiff` | AIFF and AIFF-C | `.aiff`, `.aifc` |
@@ -536,6 +537,49 @@ and BMP were added, and takes about as long.
 Each BMP and icon rule was broken in turn and made its own test fail. The
 reserved words, the DIB header sizes and the icon type are also in the scan
 pattern, so those are shown on the walk itself.
+
+**Matroska and WebM.** A file is an EBML Header, whose DocType has to be
+"matroska" (RFC 9559) or "webm", and one Segment. When the Segment's size is
+known, the file ends where the Segment does, if every element in it is whole
+(below). A writer that streams leaves it
+unknown, "all VINT_DATA bits set to one", and may leave a Cluster's unknown too
+(RFC 9559 allows both). An Unknown-Sized Element ends at the first element that
+is not one of its descendants (RFC 8794, 6.2), so the walk reads the Segment's
+children, and a Cluster's, until one that is not: the end of the file, a new EBML
+Header, or bytes that are not Matroska. Void and CRC-32 have one-byte IDs, so
+past the end of a streamed file a random 0xEC or 0xBF would pass for one. CRC-32
+counts only as the first child of its parent and is 4 bytes (RFC 8794, 11.3.1),
+and a Void counts only when a child follows it. With the two FFmpeg streamed
+files each followed by random bytes 500 times, 12 of the 1,000 ran on into the
+random bytes before those two rules, and none after.
+
+All 7 distinct WebM files from public phone images have a known Segment size and
+come back at exactly their size between zeros and between random bytes, and
+FFmpeg decodes all 7 cleanly. The fixtures are from FFmpeg 9.0.1: an `.mkv`, a
+`.webm`, and a `.webm` written with `-live 1`, whose Segment size is unknown. A
+test rewrites that file's Cluster sizes to unknown, as a recorder that streams
+its Clusters writes them, and it comes back at exactly its size between zeros and
+between random bytes.
+
+A Segment's size says what the writer meant to write, not what is there. On
+`macos-apfs`, built from Discord, Signal and Telegram data, the first version of
+this walk trusted a known Segment size and reported 1,088 WebM files; FFmpeg
+reported errors in 989 of them, and their extents hid 42 images that the run
+before had. In 182 of 200 sampled, the Clusters break off partway through the
+Segment, and those 182 are exactly the ones FFmpeg reported errors in. The
+volume's file names have no `.webm`, which fits pieces of videos kept by an app's
+media cache under the header of the whole video, though which files they sit in
+was not traced. So the walk now goes into every Cluster, and where one breaks
+off, the file ends before the block the cut fell in, which still claims its full
+size. On that volume it now reports 1,013 WebM files. FFmpeg reads 100 with no
+error, and 899 with only "ended prematurely", which a cut file gives. It decodes
+at least one frame from 628 of the 1,013; the other 385 hold a header and blocks
+that decode to no frame. No hit from the run
+before is lost on any of the eight built volumes, and the two Android volumes
+give 15 WebM files, 10 of which FFmpeg reads cleanly. A run takes about as long
+as before.
+
+Each rule was broken in turn and made its own test fail.
 
 **Binary plists.** A binary plist's length is in its trailer, at its end:
 offsetTableOffset + numObjects x offsetIntSize + 32, with the trailer laid out as

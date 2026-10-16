@@ -856,6 +856,135 @@ def test_an_lzw_strip_that_does_not_open_with_a_clear_code_hides_nothing():
     assert [h.kind for h in mediacarve.carve(stream)] == ["tiff", "png"]
 
 
+# ------------------------------------------------------------------ matroska
+
+def _mkv_with_unknown_clusters():
+    """live.webm with every Cluster's data size set to unknown, all its data
+    bits one at the same width (RFC 8794, 6.2), as a recorder that streams its
+    Clusters writes them. FFmpeg's -live leaves only the Segment unknown."""
+    data = bytearray(_load("live.webm"))
+    stream = io.BytesIO(bytes(data))
+    header = mediacarve._ebml_element(stream, 0)
+    pos = header[2] + header[1]
+    pos += mediacarve._ebml_element(stream, pos)[2]   # into the Segment
+    changed = 0
+    while pos < len(data):
+        ident, size, width, unknown = mediacarve._ebml_element(stream, pos)
+        if ident == mediacarve._MKV_CLUSTER:
+            size_width = width - 4
+            data[pos + 4] |= (1 << (8 - size_width)) - 1
+            data[pos + 5:pos + width] = b"\xff" * (size_width - 1)
+            changed += 1
+        pos += width + size
+    assert changed >= 2
+    return bytes(data)
+
+
+@pytest.mark.parametrize("filler", [b"\x00", None])
+def test_a_segment_and_clusters_of_unknown_size_end_where_the_file_does(filler):
+    data = _mkv_with_unknown_clusters()
+    pieces = [(4096, data)]
+    stream = _image(pieces) if filler else _random_image(pieces)
+    assert [(h.offset, h.length, h.ext, h.bounded) for h in mediacarve.carve(stream, kinds={"mkv"})] \
+        == [(4096, len(data), ".webm", "parsed")]
+
+
+def _mkv_blocks(data):
+    """The start and end of each child of each Cluster in a Matroska file."""
+    stream = io.BytesIO(data)
+    header = mediacarve._ebml_element(stream, 0)
+    pos = header[2] + header[1]
+    pos += mediacarve._ebml_element(stream, pos)[2]
+    blocks = []
+    while pos < len(data):
+        ident, size, width, _ = mediacarve._ebml_element(stream, pos)
+        if ident == mediacarve._MKV_CLUSTER:
+            inner = pos + width
+            while inner < pos + width + size:
+                child = mediacarve._ebml_element(stream, inner)
+                blocks.append((inner, inner + child[2] + child[1]))
+                inner += child[2] + child[1]
+        pos += width + size
+    return blocks
+
+
+def test_a_webm_cut_off_inside_a_block_ends_before_that_block():
+    """A media cache keeps the part of a video it fetched under the header of the
+    whole one (measured: 182 of 200 WebM headers sampled on a macOS volume), so
+    the Segment's size claims bytes that belong to whatever comes next. The cut
+    falls inside a block, which still claims its full size; the file ends where
+    that block starts, and the PNG after it is found."""
+    data = _load("plain.webm")
+    blocks = _mkv_blocks(data)
+    start, end = blocks[len(blocks) // 2]
+    cut = data[:(start + end) // 2]
+    png = _load("plain.png")
+    stream = _image([(4096, cut + png)])
+    hits = [(h.offset, h.length, h.kind) for h in mediacarve.carve(stream)]
+    assert hits == [(4096, start, "mkv"), (4096 + len(cut), len(png), "png")]
+
+
+def test_a_doctype_other_than_matroska_or_webm_is_not_a_file():
+    data = _load("plain.mkv")
+    at = data.index(b"matroska")
+    for other in (b"matroskb", b"webmxxxx"):
+        bad = data[:at] + other + data[at + 8:]
+        assert list(mediacarve.carve(_image([(4096, bad)]), kinds={"mkv"})) == [], other
+
+
+def test_a_segment_that_does_not_open_with_a_segment_child_is_not_a_file():
+    data = bytearray(_load("plain.webm"))
+    stream = io.BytesIO(bytes(data))
+    header = mediacarve._ebml_element(stream, 0)
+    first = header[2] + header[1] + mediacarve._ebml_element(stream, header[2] + header[1])[2]
+    data[first:first + 4] = b"\x1a\x45\xdf\xa3"         # another EBML Header, not a child
+    assert list(mediacarve.carve(_image([(4096, bytes(data))]), kinds={"mkv"})) == []
+
+
+def test_only_a_cluster_may_be_of_unknown_size_in_a_streamed_segment():
+    """RFC 9559 allows an unknown size on the Segment and the Cluster only. A
+    one-byte size of 0xFF is unknown and small enough to step over, so a Tags
+    element of unknown size has to end the walk rather than be skipped."""
+    data = _load("live.webm")
+    stream = io.BytesIO(data)
+    header = mediacarve._ebml_element(stream, 0)
+    pos = header[2] + header[1]
+    pos += mediacarve._ebml_element(stream, pos)[2]
+    while mediacarve._ebml_element(stream, pos)[0] != mediacarve._MKV_CLUSTER:
+        element = mediacarve._ebml_element(stream, pos)
+        pos += element[2] + element[1]
+    tags = b"\x12\x54\xc3\x67\xff" + bytes(127)          # Tags, data size unknown
+    padded = data[:pos] + tags + data[pos:]
+    assert list(mediacarve.carve(_image([(4096, padded)]), kinds={"mkv"})) == []
+
+
+def test_a_void_or_crc_after_the_last_cluster_does_not_extend_a_streamed_file():
+    """Void (0xEC) and CRC-32 (0xBF) have one-byte IDs, so in bytes after a
+    streamed file any 0xEC or 0xBF would pass for one. CRC-32 counts only as the
+    first child of its parent (RFC 8794, 11.3.1), and a Void only when a child
+    follows it."""
+    data = _load("live.webm")
+    for tail in (b"\xec\x84" + bytes(4), b"\xbf\x84" + bytes(4),
+                 b"\xec\x84" + bytes(4) + b"\xa3\x81\x00"):     # a Block's ID is no Segment child
+        hits = list(mediacarve.carve(_image([(4096, data + tail)]), kinds={"mkv"}))
+        assert [(h.offset, h.length) for h in hits] == [(4096, len(data))], tail[:1]
+
+
+def test_a_void_between_clusters_is_part_of_a_streamed_file():
+    data = _load("live.webm")
+    stream = io.BytesIO(data)
+    header = mediacarve._ebml_element(stream, 0)
+    pos = header[2] + header[1]
+    pos += mediacarve._ebml_element(stream, pos)[2]
+    while mediacarve._ebml_element(stream, pos)[0] != mediacarve._MKV_CLUSTER:
+        element = mediacarve._ebml_element(stream, pos)
+        pos += element[2] + element[1]
+    void = b"\xec\x84" + bytes(4)
+    padded = data[:pos] + void + data[pos:]
+    hits = list(mediacarve.carve(_image([(4096, padded)]), kinds={"mkv"}))
+    assert [(h.offset, h.length) for h in hits] == [(4096, len(padded))]
+
+
 # ------------------------------------------------------------------ bmp, ico
 
 @pytest.mark.parametrize("at,value,why", [
