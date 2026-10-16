@@ -1545,6 +1545,19 @@ def test_cli_list_counts_what_is_recoverable(tmp_path, capsys):
     assert "jpeg" in out and "png" in out and "total" in out
 
 
+def test_cli_list_verbose_shows_each_hits_extension_in_aligned_columns(tmp_path, capsys):
+    """An mp4 can be a .mov and a zip a .docx, so the listing says which, and a
+    six-letter kind such as sqlite does not push its row out of line."""
+    raw = tmp_path / "disk.raw"
+    stream = _image([(4096, _load("plain.mov")), (65536, _load("small.sqlite")),
+                     (131072, _load("plain.jpg"))])
+    raw.write_bytes(stream.getvalue())
+    assert mediacarve.main(["list", str(raw), "-q", "-v", "-k", "all"]) == 0
+    rows = [line for line in capsys.readouterr().out.splitlines() if line.strip()[:1].isdigit()]
+    assert [line.split()[2:4] for line in rows] == [["mp4", ".mov"], ["sqlite", ".sqlite"], ["jpeg", ".jpg"]]
+    assert len({line.index(line.split()[4]) for line in rows}) == 1   # bounded column lines up
+
+
 def test_cli_carve_writes_the_files(tmp_path):
     raw = tmp_path / "disk.raw"
     stream = _image([(4096, _load("plain.jpg"))])

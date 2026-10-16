@@ -49,7 +49,7 @@ import zipfile
 import zlib
 from typing import NamedTuple
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 # How much to read at a time while scanning, and how much to carry over so a
 # signature straddling two blocks is still found.
@@ -1628,6 +1628,13 @@ def _progress(pos, end):
         sys.stderr.flush()
 
 
+# Column widths for "list": the longest kind, and the longest extension a hit
+# can carry (".sqlite"). A hit's extension can differ from its kind's default:
+# an mp4 can be a .mov or .3gp, a zip an .apk or .docx.
+_KIND_WIDTH = max(len(k) for k in ALL_KINDS)
+_EXT_WIDTH = 7
+
+
 def _cmd_list(args):
     kinds = _kinds_arg(args.kinds)
     with open_source(args.image) as src:
@@ -1638,12 +1645,13 @@ def _cmd_list(args):
             counts[hit.kind] = counts.get(hit.kind, 0) + 1
             total += hit.length
             if args.verbose:
-                print(f"{hit.offset:>16}  {hit.length:>12}  {hit.kind:<5} {hit.bounded}")
+                print(f"{hit.offset:>16}  {hit.length:>12}  {hit.kind:<{_KIND_WIDTH}}  "
+                      f"{hit.ext:<{_EXT_WIDTH}}  {hit.bounded}")
         if not args.quiet:
             sys.stderr.write("\r" + " " * 48 + "\r")
     for kind in sorted(counts):
-        print(f"  {kind:<6} {counts[kind]:>8,}")
-    print(f"  {'total':<6} {sum(counts.values()):>8,}  ({_size(total)})")
+        print(f"  {kind:<{_KIND_WIDTH}} {counts[kind]:>8,}")
+    print(f"  {'total':<{_KIND_WIDTH}} {sum(counts.values()):>8,}  ({_size(total)})")
     return 0
 
 

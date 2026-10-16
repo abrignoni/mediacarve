@@ -107,7 +107,8 @@ def build_window(initial_image="", smoke=None):
     options.grid(row=2, column=1, sticky="w", pady=(4, 0))
     ttk.Label(options, text="Kinds").pack(side="left")
     ttk.Combobox(options, textvariable=v_kinds, values=KINDS, width=24).pack(side="left", padx=(6, 12))
-    ttk.Label(options, text="(or a list such as jpeg,png,mp4)", foreground="gray").pack(side="left")
+    ttk.Label(options, text="(or a list: media,databases or jpeg,png)",
+              foreground="gray").pack(side="left")
     ttk.Checkbutton(options, text="Also files inside other files (EXIF thumbnails)",
                     variable=v_nested).pack(side="left", padx=(12, 0))
     form.columnconfigure(1, weight=1)
