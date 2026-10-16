@@ -64,6 +64,12 @@ def _image(pieces, size=None, filler=b"\x00", seed=11):
 
 # ------------------------------------------------------------------ recovery
 
+def _carved_length(meta):
+    """A TIFF has no length field and ends at its last structure, so zero bytes a
+    writer leaves after that are not carved; the manifest records how many."""
+    return meta["length"] - meta.get("padding", 0)
+
+
 def _outside_media(hits, kind, offset, length):
     """Hits other than media found inside a fixture of a kind that hides no
     media: a PDF's page image is still a JPEG."""
@@ -82,7 +88,7 @@ def test_each_fixture_is_recovered_exactly_on_its_own(name, meta):
     assert len(hits) == 1, f"{name}: {[(h.kind, h.offset, h.length) for h in hits]}"
     hit = hits[0]
     assert (hit.offset, hit.length, hit.kind, hit.ext) \
-        == (0, meta["length"], meta["kind"], meta["ext"])
+        == (0, _carved_length(meta), meta["kind"], meta["ext"])
 
 
 @pytest.mark.parametrize("name,meta", _fixtures())
@@ -94,9 +100,9 @@ def test_each_fixture_is_recovered_from_inside_a_larger_image(name, meta):
     hits = _outside_media(hits, meta["kind"], offset, meta["length"])
     assert len(hits) == 1, name
     hit = hits[0]
-    assert (hit.offset, hit.length) == (offset, meta["length"])
+    assert (hit.offset, hit.length) == (offset, _carved_length(meta))
     stream.seek(hit.offset)
-    assert hashlib.sha256(stream.read(hit.length)).hexdigest() == meta["sha256"]
+    assert hashlib.sha256(stream.read(meta["length"])).hexdigest() == meta["sha256"]
 
 
 def test_several_files_in_one_image_all_come_back_byte_for_byte():
@@ -106,17 +112,17 @@ def test_several_files_in_one_image_all_come_back_byte_for_byte():
     for m in media:
         data = _load(m["name"])
         pieces.append((offset, data))
-        expected.append((offset, m["length"], m["kind"], m["sha256"]))
+        expected.append((offset, _carved_length(m), m["kind"], m["sha256"], m["length"]))
         offset += len(data) + rnd.randrange(1000, 9000)
     stream = _image(pieces)
     hits = list(mediacarve.carve(stream, kinds=mediacarve.ALL_KINDS))
-    for off, length, kind, _ in expected:
+    for off, length, kind, _, _ in expected:
         hits = [h for h in hits if h.offset == off or h in _outside_media([h], kind, off, length)]
     assert len(hits) == len(expected)
-    for hit, (off, length, kind, sha) in zip(hits, expected):
+    for hit, (off, length, kind, sha, size) in zip(hits, expected):
         assert (hit.offset, hit.length, hit.kind) == (off, length, kind)
         stream.seek(hit.offset)
-        assert hashlib.sha256(stream.read(hit.length)).hexdigest() == sha
+        assert hashlib.sha256(stream.read(size)).hexdigest() == sha
 
 
 def test_an_exif_thumbnail_is_not_a_separate_file_by_default():
@@ -734,6 +740,120 @@ def test_page_one_copied_into_a_log_is_not_a_database():
     stream = _image([(4096, db)])                 # the same bytes, not in a log
     assert [h.offset for h in mediacarve.carve(stream, kinds={"sqlite"})] == [4096]
 
+
+
+# ---------------------------------------------------------------------- tiff
+
+def _tiff_entry(data, tag):
+    """The position of IFD 0's entry for ``tag`` in a little-endian TIFF."""
+    ifd = struct.unpack("<I", data[4:8])[0]
+    for i in range(struct.unpack("<H", data[ifd:ifd + 2])[0]):
+        at = ifd + 2 + 12 * i
+        if struct.unpack("<H", data[at:at + 2])[0] == tag:
+            return at
+    raise KeyError(tag)
+
+
+def _tiff_set(data, tag, value):
+    data = bytearray(data)
+    at = _tiff_entry(data, tag)
+    data[at + 8:at + 12] = struct.pack("<I", value)
+    return bytes(data)
+
+
+def _tiff(ifd0, more=b"", data=b""):
+    """A little-endian TIFF: header, IFD 0 at 8 with ``ifd0`` as (tag, type,
+    count, value) entries, then ``data``, then ``more``."""
+    body = struct.pack("<H", len(ifd0)) + b"".join(struct.pack("<HHII", *e) for e in ifd0) + bytes(4)
+    return b"II*\x00" + struct.pack("<I", 8) + body + data + more
+
+
+def test_a_tiff_with_no_image_is_not_a_file():
+    """Exif data is a TIFF with no image of its own: IFD 0 describes the JPEG
+    around it and has no strips or tiles. Taken out of its JPEG it is not
+    reported, and the same IFD with one strip added is."""
+    make = b"Maker of the camera, long enough to pass the floor\x00"
+    tags = [(271, 2, len(make), 8 + 2 + 12 * 3 + 4), (274, 3, 1, 1), (282, 5, 1, 0)]
+    exif = _tiff(tags, data=make)
+    assert list(mediacarve.carve(_image([(4096, exif)]), kinds={"tiff"})) == []
+    strip = b"\x00" * 64
+    start = 8 + 2 + 12 * 4 + 4
+    image = _tiff([(256, 3, 1, 8), (257, 3, 1, 8), (273, 4, 1, start), (279, 4, 1, len(strip))], data=strip)
+    assert [(h.offset, h.length) for h in mediacarve.carve(_image([(4096, image)]), kinds={"tiff"})] \
+        == [(4096, len(image))]
+
+
+def test_an_exif_ifd_after_the_image_counts():
+    """An IFD may be anywhere in the file (TIFF 6.0, section 2), and the Exif IFD
+    is found through its tag (Exif 2.3, 4.6.3), so one written after the image
+    data is where the file ends."""
+    strip = b"\x00" * 64
+    start = 8 + 2 + 12 * 5 + 4
+    exif_at = start + len(strip)
+    exif_ifd = struct.pack("<H", 1) + struct.pack("<HHII", 36864, 7, 4, 0x30333230) + bytes(4)
+    image = _tiff([(256, 3, 1, 8), (257, 3, 1, 8), (273, 4, 1, start), (279, 4, 1, len(strip)),
+                   (34665, 4, 1, exif_at)], data=strip, more=exif_ifd)
+    assert [(h.offset, h.length) for h in mediacarve.carve(_image([(4096, image)]), kinds={"tiff"})] \
+        == [(4096, len(image))]
+
+
+def test_a_tiff_whose_tags_are_not_in_order_is_not_a_file():
+    """TIFF 6.0, section 2: "The entries in an IFD must be sorted in ascending
+    order by Tag." Measured: all 321 real TIFFs read keep the order."""
+    data = bytearray(_load("raw.tif"))
+    first, second = _tiff_entry(data, 256), _tiff_entry(data, 257)
+    data[first:first + 12], data[second:second + 12] = data[second:second + 12], data[first:first + 12]
+    assert list(mediacarve.carve(_image([(4096, bytes(data))]), kinds={"tiff"})) == []
+
+
+def test_a_tiff_with_a_field_type_it_cannot_size_is_not_a_file():
+    data = bytearray(_load("raw.tif"))
+    at = _tiff_entry(data, 262)
+    data[at + 2:at + 4] = struct.pack("<H", 99)
+    assert list(mediacarve.carve(_image([(4096, bytes(data))]), kinds={"tiff"})) == []
+
+
+def test_every_page_in_the_ifd_chain_counts():
+    """pages.tif holds two images in two IFDs, the second after the first's
+    data; the end is the second page's."""
+    data = _load("pages.tif")
+    meta = next(m for m in _manifest() if m["name"] == "pages.tif")
+    ifd = struct.unpack("<I", data[4:8])[0]
+    n = struct.unpack("<H", data[ifd:ifd + 2])[0]
+    assert struct.unpack("<I", data[ifd + 2 + 12 * n:ifd + 6 + 12 * n])[0] > ifd
+    hits = list(mediacarve.carve(_image([(4096, data)]), kinds={"tiff"}))
+    assert [(h.offset, h.length) for h in hits] == [(4096, meta["length"] - meta["padding"])]
+
+
+def test_a_tiff_hides_what_it_holds_only_when_its_strips_open_right():
+    """A TIFF has no length field; its end is the furthest place its pointers
+    reach, and a pointer can reach past the file (measured: 2 of 323 real TIFFs).
+    An LZW strip opens with a ClearCode, 0x80 (TIFF 6.0, section 13), so an LZW
+    TIFF whose strips all open with it hides a PNG its byte count covers; an
+    uncompressed one, which nothing confirms, hides nothing."""
+    png = _load("plain.png")
+    for name, hides in (("plain.tif", True), ("raw.tif", False)):
+        data = _load(name)
+        reach = len(data) + 4096 + len(png) + 4096
+        strips = struct.unpack("<I", data[_tiff_entry(data, 279) + 8:_tiff_entry(data, 279) + 12])[0]
+        start = struct.unpack("<I", data[_tiff_entry(data, 273) + 8:_tiff_entry(data, 273) + 12])[0]
+        assert struct.unpack("<I", data[_tiff_entry(data, 279) + 4:_tiff_entry(data, 279) + 8])[0] == 1
+        stretched = _tiff_set(data, 279, reach - start)       # one strip, its count over the PNG
+        assert strips < reach - start
+        stream = _image([(4096, stretched), (4096 + len(data) + 4096, png)])
+        kinds = [h.kind for h in mediacarve.carve(stream)]
+        assert kinds == (["tiff"] if hides else ["tiff", "png"]), name
+
+
+def test_an_lzw_strip_that_does_not_open_with_a_clear_code_hides_nothing():
+    png = _load("plain.png")
+    data = bytearray(_load("plain.tif"))
+    start = struct.unpack("<I", data[_tiff_entry(data, 273) + 8:_tiff_entry(data, 273) + 12])[0]
+    assert data[start] == 0x80
+    data[start] = 0x00
+    stretched = _tiff_set(bytes(data), 279, len(data) + 4096 + len(png) + 4096 - start)
+    stream = _image([(4096, stretched), (4096 + len(data) + 4096, png)])
+    assert [h.kind for h in mediacarve.carve(stream)] == ["tiff", "png"]
 
 
 # ---------------------------------------------------------- sqlite-encrypted

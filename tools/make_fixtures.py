@@ -11,8 +11,8 @@ themselves need nothing but pytest.
     python tools/make_fixtures.py tests/fixtures/media
     python tools/make_fixtures.py tests/fixtures/media --only av
 
-``--only`` writes one group (stills, opencv, av, pcm, mp3, db, sqlcipher, plist, zip
-or pdf) and keeps the manifest entries
+``--only`` writes one group (stills, opencv, av, pcm, mp3, db, sqlcipher, plist, zip,
+pdf or tiff) and keeps the manifest entries
 of the others, so adding a group does not re-encode the files already committed.
 The av group needs ffmpeg, the opencore-amr and vo-amrwbenc libraries for AMR
 (Homebrew has both), and sips from macOS for HEIC. The pcm group needs ffmpeg and
@@ -51,11 +51,15 @@ def write_media(out_dir, only=None):
     os.makedirs(out_dir, exist_ok=True)
     made = []
 
-    def record(name, kind, ext=None):
+    def record(name, kind, ext=None, padding=0):
         path = os.path.join(out_dir, name)
         data = open(path, "rb").read()
-        made.append({"name": name, "kind": kind, "ext": ext or os.path.splitext(name)[1],
-                     "length": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+        entry = {"name": name, "kind": kind, "ext": ext or os.path.splitext(name)[1],
+                 "length": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        if padding:                               # zero bytes the writer left after the file's structures
+            assert data[-padding:] == bytes(padding), name
+            entry["padding"] = padding
+        made.append(entry)
 
     if only in (None, "stills"):
         _write_stills(out_dir, record)
@@ -69,6 +73,8 @@ def write_media(out_dir, only=None):
         _write_mp3(out_dir, record)
     if only in (None, "db"):
         _write_db(out_dir, record)
+    if only in (None, "tiff"):
+        _write_tiff(out_dir, record)
     if only in (None, "sqlcipher"):
         _write_sqlcipher(out_dir, record)
     if only in (None, "plist"):
@@ -188,6 +194,45 @@ def _write_db(out_dir, record):
     con.commit()
     con.close()
     record("small.sqlite", "sqlite")
+
+
+def _write_tiff(out_dir, record):
+    """TIFF from four writers: Pillow (little-endian; LZW, uncompressed, and two
+    pages in one IFD chain), ExifTool (Exif and GPS IFDs added to a copy), macOS
+    sips (Apple's own writer, big-endian, as the TIFFs on iPhones are), and
+    libtiff's tiffcp (tiles, Deflate)."""
+    from PIL import Image
+    im = _noisy(Image.new("RGB", (96, 64), (90, 30, 160)), 41, 8)
+    im.save(os.path.join(out_dir, "plain.tif"), "TIFF", compression="tiff_lzw")
+    record("plain.tif", "tiff")
+    im.save(os.path.join(out_dir, "raw.tif"), "TIFF", compression=None)
+    record("raw.tif", "tiff")
+    second = _noisy(Image.new("RGB", (48, 32), (10, 200, 90)), 42, 8)
+    im.save(os.path.join(out_dir, "pages.tif"), "TIFF", compression="tiff_adobe_deflate",
+            save_all=True, append_images=[second])
+    record("pages.tif", "tiff", padding=12)      # Pillow 12.3.0 wrote 12 zero bytes after the last IFD
+    exiftool = shutil.which("exiftool")
+    if exiftool:                                  # ExifTool adds an Exif IFD to a copy
+        shutil.copy(os.path.join(out_dir, "plain.tif"), os.path.join(out_dir, "exif.tif"))
+        _run(exiftool, "-q", "-overwrite_original", "-DateTimeOriginal=2026:10:16 12:00:00",
+             "-GPSLatitude=18.4", "-GPSLatitudeRef=N", os.path.join(out_dir, "exif.tif"))
+        record("exif.tif", "tiff", padding=1)    # ExifTool 13.44 padded the last value to an even end
+    else:
+        print("  exiftool absent: no TIFF with an Exif IFD written", file=sys.stderr)
+    sips = shutil.which("sips")
+    if sips:
+        _run(sips, "-s", "format", "tiff", "-s", "formatOptions", "lzw",
+             os.path.join(out_dir, "plain.png"), "--out", os.path.join(out_dir, "sips.tif"))
+        record("sips.tif", "tiff")
+    else:
+        print("  sips absent: no Apple TIFF written", file=sys.stderr)
+    tiffcp = shutil.which("tiffcp")
+    if tiffcp:
+        _run(tiffcp, "-t", "-w", "32", "-l", "32", "-c", "zip",
+             os.path.join(out_dir, "raw.tif"), os.path.join(out_dir, "tiled.tif"))
+        record("tiled.tif", "tiff")
+    else:
+        print("  tiffcp absent: no tiled TIFF written", file=sys.stderr)
 
 
 def _write_sqlcipher(out_dir, record):
@@ -448,7 +493,7 @@ def _write_videos(out_dir, record):
 
 def main(argv):
     only = None
-    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "sqlcipher", "plist", "zip", "pdf"):
+    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "sqlcipher", "plist", "zip", "pdf", "tiff"):
         only = argv[3]
     elif len(argv) != 2:
         print(__doc__)

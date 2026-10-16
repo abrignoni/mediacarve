@@ -68,7 +68,7 @@ mediacarve list  disk.raw -v                 # one line per file: offset, length
                                              # kind, extension, how it was bounded
 mediacarve carve disk.raw -o carved/         # write the files out
 mediacarve carve disk.raw -o carved.zip      # or into a zip
-mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic
+mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic, tiff
 mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, wav, aiff, caf, mp3
 mediacarve carve disk.raw -o out/ -k databases   # sqlite, sqlite-encrypted
 mediacarve carve disk.raw -o out/ -k plists  # binary plists
@@ -156,6 +156,7 @@ dated, path-anchored files.
 | `avi` | AVI | `.avi` |
 | `mp4` | ISO-BMFF video | from the brand: `.mov`, `.3gp`, `.3g2`, `.m4v`, otherwise `.mp4` |
 | `heic` | ISO-BMFF stills | from the brands: `.heic`, `.avif`, otherwise `.heif` |
+| `tiff` | TIFF, little- and big-endian (not BigTIFF) | `.tif` |
 | `m4a` | ISO-BMFF with an iTunes audio brand | `.m4a`, `.m4b`, `.m4p` |
 | `ogg` | Ogg audio | from the codec: `.opus`, `.spx`, `.oga` (FLAC), otherwise `.ogg` |
 | `ogv` | Ogg with a Theora stream | `.ogv` |
@@ -188,8 +189,8 @@ Single-channel AMR only. The multi-channel AMR headers, AMR inside 3GP (that is
 ISO-BMFF, and carves as `mp4`), and SILK voice files (`#!SILK_V3`), which one public
 Android image stores under `com.tencent.mm` with an `.amr` name, are not covered.
 
-BMP and TIFF are not covered: BMP's signature is two bytes and TIFF's length is
-not in its header, so both would cost more in false positives than they return.
+BMP is not covered: its signature is two bytes, so it would cost more in false
+positives than it returns.
 
 ## How it was validated
 
@@ -458,6 +459,45 @@ encrypted after its header. The other six volumes give none, and on all eight th
 Each rule was broken in turn and made its own test fail: the reserve, the zero
 bytes at 72 to 91 that keep a plain database from being called encrypted, the WAL
 page-number rule, the kind, and the encrypted path itself.
+
+**TIFF.** A TIFF has no length field. It is an 8-byte header naming the first
+IFD, and an IFD's values and image data may be "anywhere in the file, even after
+the image data" (TIFF 6.0, section 2). So its end is the furthest byte any of
+its structures reaches: every IFD in the chain and every IFD a SubIFD, Exif, GPS
+or Interoperability tag points to, every value stored out of line, and every
+strip, tile and JPEG stream with its byte count. A TIFF is taken only with at
+least one entry in every IFD, entries in ascending tag order (section 2), field
+types it can size, and an image (strips or tiles), so the Exif data in a JPEG or
+a HEIC, a TIFF with no image of its own, is not a file.
+
+On 323 distinct TIFFs from public phone images, laid between zeros and again between
+random bytes, 268 came back at exactly their size both times. 51 end 1 to 4
+bytes early, and the bytes left are zeros the writer put after the last
+structure. 2 are GeoTIFFs under 1 KB whose tile table points 4 MB past the end
+of the file, and 2 are BigTIFF, which is not read. Pillow decodes 300 of the
+carved files and fails on 19 it also fails on as they were stored; the other 2
+are the GeoTIFFs, whose carved extent runs into the bytes after them.
+
+Because an end taken from pointers can run past the file, a TIFF hides what
+follows it only when every strip and tile opens the way its compression says it
+must: an LZW strip with the 0x80 of its first ClearCode (section 13), a Deflate
+strip with a zlib header (RFC 1950, 2.2). In all 240 LZW and Deflate files above,
+every strip does. An uncompressed TIFF, which nothing confirms, is still reported
+and hides nothing, so the two GeoTIFFs no longer hide the 70 files laid after
+them, which they did before this rule.
+
+On the built volumes, the two made from `jess_ios15` each give 4 TIFF hits,
+byte-identical to the 4 TIFFs in that extraction. The other six give none, and
+on all eight every hit 0.10.0 reports is unchanged. PhotoRec 7.2, run as above,
+recovered no TIFF on the five volumes it was run on.
+
+The test fixtures are written by Pillow (LZW, uncompressed, two pages), ExifTool
+(Exif and GPS IFDs), macOS sips (big-endian, as the iPhone TIFFs are) and
+libtiff's tiffcp (tiles, Deflate). Pillow's two-page file ends with 12 zero
+bytes and ExifTool's with 1, which are not carved. Each rule was broken in turn
+and made its own test fail: the IFD chain, the sub-IFD tags, out-of-line values,
+strip extents, the image requirement, tag order, field types, the LZW check, and
+hiding only when confirmed.
 
 **Binary plists.** A binary plist's length is in its trailer, at its end:
 offsetTableOffset + numObjects x offsetIntSize + 32, with the trailer laid out as

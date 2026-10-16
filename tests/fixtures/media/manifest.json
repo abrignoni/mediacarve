@@ -230,6 +230,50 @@
       "ext": ".sqlite",
       "length": 47104,
       "sha256": "3e9f4a31c0e4d7779018ad0a98a2492422513ae07c921d211b34ccf334eccf21"
+    },
+    {
+      "name": "plain.tif",
+      "kind": "tiff",
+      "ext": ".tif",
+      "length": 4228,
+      "sha256": "e0311dc04cded12f573fc46014dc1be54c17feb6ab9cd4cbff021049aa9085ed"
+    },
+    {
+      "name": "raw.tif",
+      "kind": "tiff",
+      "ext": ".tif",
+      "length": 18572,
+      "sha256": "77f76c664755bfb3b0a8e5d72f11ee6ba5d0e15523a8c92159a4a12d01826ce3"
+    },
+    {
+      "name": "pages.tif",
+      "kind": "tiff",
+      "ext": ".tif",
+      "length": 5008,
+      "sha256": "088379082c01b9cf31364e7f3b4229c9e1b02a4e0d315e95ea674a464370b5e1",
+      "padding": 12
+    },
+    {
+      "name": "exif.tif",
+      "kind": "tiff",
+      "ext": ".tif",
+      "length": 4392,
+      "sha256": "a09c8a522b0c01b85e023c2aa78deea3d1a179468c4b5cb66ab9e64a30fd78ff",
+      "padding": 1
+    },
+    {
+      "name": "sips.tif",
+      "kind": "tiff",
+      "ext": ".tif",
+      "length": 9702,
+      "sha256": "366cc836b3319c3853e92f17c1a68ce125a28078f6a9997633748639caed78d3"
+    },
+    {
+      "name": "tiled.tif",
+      "kind": "tiff",
+      "ext": ".tif",
+      "length": 3988,
+      "sha256": "a7c152c5fe66ed3291524fa7532b411cb7230c619cb5bd3cdd81fb887ab2d0d2"
     }
   ]
 }
