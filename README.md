@@ -64,7 +64,8 @@ which writes a folder or a zip. Both come out of the same scan.
 
 ```
 mediacarve list  disk.raw                    # count what is recoverable
-mediacarve list  disk.raw -v                 # one line per file
+mediacarve list  disk.raw -v                 # one line per file: offset, length,
+                                             # kind, extension, how it was bounded
 mediacarve carve disk.raw -o carved/         # write the files out
 mediacarve carve disk.raw -o carved.zip      # or into a zip
 mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic
