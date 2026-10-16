@@ -4,43 +4,113 @@
       "name": "plain.jpg",
       "kind": "jpeg",
       "length": 10398,
-      "sha256": "c2e7569a37ae89e76ee22feedff690032efe984b6c7b5e5f0ea7c86a8c11a615"
+      "sha256": "c2e7569a37ae89e76ee22feedff690032efe984b6c7b5e5f0ea7c86a8c11a615",
+      "ext": ".jpg"
     },
     {
       "name": "thumbed.jpg",
       "kind": "jpeg",
       "length": 47117,
-      "sha256": "794255bd9659011c617b9af8fdb3e20a76a3d086b24a6abe4cfea163821a98c3"
+      "sha256": "794255bd9659011c617b9af8fdb3e20a76a3d086b24a6abe4cfea163821a98c3",
+      "ext": ".jpg"
     },
     {
       "name": "plain.png",
       "kind": "png",
       "length": 5501,
-      "sha256": "85cc56a9a736932c286ee7b70ba079630a9cf2eef03bb7ce351b10a9f21df0a3"
+      "sha256": "85cc56a9a736932c286ee7b70ba079630a9cf2eef03bb7ce351b10a9f21df0a3",
+      "ext": ".png"
     },
     {
       "name": "plain.gif",
       "kind": "gif",
       "length": 144,
-      "sha256": "6e3595d80a342d219573a1f9ad00860de47f494fccf557900d82d749fe9a4671"
+      "sha256": "6e3595d80a342d219573a1f9ad00860de47f494fccf557900d82d749fe9a4671",
+      "ext": ".gif"
     },
     {
       "name": "plain.webp",
       "kind": "webp",
       "length": 2194,
-      "sha256": "2991d1b853c833219319dd3d7e20d7b67438b0e1d34ddbd31dc54e77f42a98d2"
+      "sha256": "2991d1b853c833219319dd3d7e20d7b67438b0e1d34ddbd31dc54e77f42a98d2",
+      "ext": ".webp"
     },
     {
       "name": "plain.mp4",
       "kind": "mp4",
       "length": 45601,
-      "sha256": "a05bdbbe6eb3536a770d190811f39d9004b091c23dffd883c166032f21d863b6"
+      "sha256": "a05bdbbe6eb3536a770d190811f39d9004b091c23dffd883c166032f21d863b6",
+      "ext": ".mp4"
     },
     {
       "name": "plain.avi",
       "kind": "avi",
       "length": 64368,
-      "sha256": "e04016cbc3b25a9f45dc15887083e427a4584810738bf89602d128dec9b94bcb"
+      "sha256": "e04016cbc3b25a9f45dc15887083e427a4584810738bf89602d128dec9b94bcb",
+      "ext": ".avi"
+    },
+    {
+      "name": "plain.mov",
+      "kind": "mp4",
+      "ext": ".mov",
+      "length": 8251,
+      "sha256": "9e783e772a4435db1023c85db139399cc47b1526e3538a434817d16323d273d3"
+    },
+    {
+      "name": "plain.3gp",
+      "kind": "mp4",
+      "ext": ".3gp",
+      "length": 13400,
+      "sha256": "545a2baea11d6ab2b0dafc4406722263b8762cdb2800e417d9ac6448d97d4cb8"
+    },
+    {
+      "name": "plain.m4a",
+      "kind": "m4a",
+      "ext": ".m4a",
+      "length": 5164,
+      "sha256": "bb19ef26f4bbf160302ff3b6ae38121299b6a752652cb3630c3b1a1fdce8aecb"
+    },
+    {
+      "name": "plain.opus",
+      "kind": "ogg",
+      "ext": ".opus",
+      "length": 3140,
+      "sha256": "ff72c5ba2b602d6d565c679dd0f3ace95ec9b32970282fed90c5a7b01d2b6db3"
+    },
+    {
+      "name": "plain.ogg",
+      "kind": "ogg",
+      "ext": ".ogg",
+      "length": 42094,
+      "sha256": "ae431e56a5b85529b9b996f41d73f184be11e2fb9a34726894c2f9336043d6e3"
+    },
+    {
+      "name": "plain.amr",
+      "kind": "amr",
+      "ext": ".amr",
+      "length": 1894,
+      "sha256": "4fc860c985d2449f45fb10b11615d97e1b7826e8e7d61d8bd4aca4faeacf46c5"
+    },
+    {
+      "name": "plain.awb",
+      "kind": "amr",
+      "ext": ".awb",
+      "length": 2019,
+      "sha256": "888d40c82a3d604a6e6e52352c8e2c3de62fff796dce5f85b01baba91df09eed"
+    },
+    {
+      "name": "plain.heic",
+      "kind": "heic",
+      "ext": ".heic",
+      "length": 2602,
+      "sha256": "fc3301884f9c52f575b90498d880eb8516228bae5e34cdd4f832d0ae03f2a1fd"
+    },
+    {
+      "name": "plain.avif",
+      "kind": "heic",
+      "ext": ".avif",
+      "length": 1830,
+      "sha256": "a02ef6f42b68d2644bd17a4104311ac3ff8fb8b6b511bd8ddfb0e22f17ea7af8"
     }
   ]
 }

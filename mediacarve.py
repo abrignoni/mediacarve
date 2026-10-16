@@ -1,4 +1,4 @@
-"""mediacarve: recover images and video from any stream of bytes, by signature.
+"""mediacarve: recover images, video and audio from any stream of bytes, by signature.
 
 One file, pure Python, standard library only. No compiler, no network, and
 nothing to install. It scans a seekable stream for media file signatures and
@@ -46,9 +46,10 @@ import re
 import struct
 import sys
 import zipfile
+import zlib
 from typing import NamedTuple
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # How much to read at a time while scanning, and how much to carry over so a
 # signature straddling two blocks is still found.
@@ -67,6 +68,10 @@ DEFAULT_CAPS = {
     "avi": 4 << 30,
     "mp4": 4 << 30,
     "heic": 64 << 20,
+    "m4a": 4 << 30,
+    "ogg": 1 << 30,
+    "ogv": 4 << 30,
+    "amr": 64 << 20,
 }
 _ABSOLUTE_CAP = 4 << 30
 
@@ -76,15 +81,20 @@ _ABSOLUTE_CAP = 4 << 30
 MIN_LENGTHS = {
     "jpeg": 128, "png": 128, "gif": 64, "webp": 64,
     "avi": 1024, "mp4": 1024, "heic": 512,
+    "m4a": 1024, "ogg": 128, "ogv": 1024, "amr": 256,
 }
 
+# The conventional extension for each kind. ISO-BMFF, Ogg and AMR refine it from
+# the brand, codec or header they find (see _bmff_ext, _ogg_length, _amr_length).
 EXTENSIONS = {
     "jpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp",
     "avi": ".avi", "mp4": ".mp4", "heic": ".heic",
+    "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "amr": ".amr",
 }
 
 IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic"})
-VIDEO_KINDS = frozenset({"avi", "mp4"})
+VIDEO_KINDS = frozenset({"avi", "mp4", "ogv"})
+AUDIO_KINDS = frozenset({"m4a", "ogg", "amr"})
 
 
 class Candidate(NamedTuple):
@@ -113,7 +123,9 @@ _SCAN = re.compile(
     b"|\x89PNG\r\n\x1a\n"        # PNG
     b"|GIF8[79]a"                # GIF
     b"|RIFF"                     # RIFF container, form checked below
-    b"|ftyp",                    # ISO-BMFF, four bytes in
+    b"|ftyp"                     # ISO-BMFF, four bytes in
+    b"|OggS\x00[\x02\x06]"       # Ogg page, version 0, first of its stream
+    b"|#!AMR(?:-WB)?\n",          # single-channel AMR or AMR-WB storage file
     re.DOTALL)
 
 # Top-level ISO-BMFF box types the carver knows. A file has to show at least one
@@ -135,6 +147,15 @@ _HEIC_BRANDS = frozenset({
     b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1",
     b"avif", b"avis",
 })
+
+# Brands that name a file's extension, as the MP4 registration authority lists
+# them (mp4ra.org, data/brands.csv at 35c6ffe). "M4A " is iTunes MPEG-4 audio;
+# the registry notes it can also carry video, but the brand is the writer's own
+# statement that the file is audio. A brand not listed here keeps ".mp4".
+_AUDIO_BRANDS = {b"M4A ": ".m4a", b"M4B ": ".m4b", b"M4P ": ".m4p"}
+_VIDEO_BRAND_EXT = {b"qt  ": ".mov", b"M4V ": ".m4v"}
+_AVIF_BRANDS = frozenset({b"avif", b"avis"})
+_HEVC_STILL_BRANDS = frozenset({b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx"})
 
 
 def _read_at(stream, offset, size):
@@ -288,8 +309,55 @@ def _riff_length(stream, offset, caps):
     return total, "header", kind
 
 
+def _bmff_ext(major, compatible):
+    """The kind and extension an ftyp names.
+
+    Stills keep the kind "heic" and video "mp4", so a filter on those kinds
+    selects what it did before, and only the extension follows the brand. Audio
+    brands are their own kind. A generic HEIF brand (mif1, msf1) says nothing
+    about the codec, so the compatible brands decide between .avif, .heic and
+    .heif.
+    """
+    if major in _AUDIO_BRANDS:
+        return "m4a", _AUDIO_BRANDS[major]
+    if major in _HEIC_BRANDS:
+        brands = {major, *compatible}
+        if brands & _AVIF_BRANDS:
+            return "heic", ".avif"
+        if brands & _HEVC_STILL_BRANDS:
+            return "heic", ".heic"
+        return "heic", ".heif"
+    if major in _VIDEO_BRAND_EXT:
+        return "mp4", _VIDEO_BRAND_EXT[major]
+    if major.startswith(b"3g2"):
+        return "mp4", ".3g2"
+    if major.startswith(b"3g"):
+        return "mp4", ".3gp"
+    return "mp4", ".mp4"
+
+
+def _box_follows(stream, at):
+    """True when a well-formed box header, or the end of the stream, is at ``at``.
+
+    A vendor box is taken on its shape alone, so after a file has ended, four
+    printable bytes in whatever follows can pass for one, with a size read from
+    the four bytes before them. Measured on real voice notes laid into random
+    bytes: one such "box" declared 4,265,331,032 bytes, and the extent it gave
+    hid 106 files behind it. 0.2.0 reported the same extent. A real box is followed by another box, or by the end
+    of the stream.
+    """
+    head = _read_at(stream, at, 8)
+    if not head:
+        stream.seek(0, os.SEEK_END)
+        return stream.tell() == at                # exactly at the end, not past it
+    if len(head) < 8:
+        return False
+    size = struct.unpack(">I", head[:4])[0]
+    return all(0x20 <= b < 0x7F for b in head[4:8]) and (size >= 8 or size in (0, 1))
+
+
 def _bmff_length(stream, offset, caps):
-    """Sum ISO-BMFF top-level boxes. The brand decides stills from video.
+    """Sum ISO-BMFF top-level boxes. The brand decides the kind and extension.
 
     The ftyp box is validated before anything is summed. A bare "ftyp" is only
     four bytes and turns up inside ordinary text: measured on a real Windows
@@ -310,7 +378,9 @@ def _bmff_length(stream, offset, caps):
     brand = head[8:12]
     if not all(0x20 <= b < 0x7F for b in brand):
         return None
-    kind = "heic" if brand in _HEIC_BRANDS else "mp4"
+    ftyp = _read_at(stream, offset, ftyp_size)
+    compatible = {ftyp[i:i + 4] for i in range(16, len(ftyp) - 3, 4)}
+    kind, ext = _bmff_ext(brand, compatible)
     cap = _cap(caps, kind)
     pos = offset
     end = offset + cap
@@ -322,7 +392,8 @@ def _bmff_length(stream, offset, caps):
             break
         size = struct.unpack(">I", head[:4])[0]
         btype = head[4:8]
-        if btype in _BMFF_BOXES:
+        vendor = btype not in _BMFF_BOXES
+        if not vendor:
             if btype == b"ftyp":
                 if seen_ftyp:
                     break                         # the next file starts here
@@ -339,6 +410,9 @@ def _bmff_length(stream, offset, caps):
             break                                 # runs to end of stream
         if size < 8:
             break
+        if vendor and not _box_follows(stream, pos + size):
+            break                                 # four printable bytes after a
+                                                  # file, not a box of it
         pos += size
         boxes += 1
     length = pos - offset
@@ -346,8 +420,168 @@ def _bmff_length(stream, offset, caps):
         return None                              # ftyp alone, or ftyp plus
                                                  # only boxes it cannot vouch for
     if length > cap:
-        return cap, "capped", kind
-    return length, "header", kind
+        return cap, "capped", kind, ext
+    return length, "header", kind, ext
+
+# Ogg pages carry a CRC-32 with the generator polynomial 0x04c11db7 (RFC 3533,
+# section 6), computed MSB first with a zero start and no final inversion, over
+# the page with its CRC field zeroed. zlib computes the same polynomial LSB
+# first, so the bytes go in bit-reversed and the result comes out reversed.
+_BITREV = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
+
+
+def _ogg_crc(page):
+    reflected = zlib.crc32(page.translate(_BITREV), 0xFFFFFFFF) ^ 0xFFFFFFFF
+    return int(f"{reflected:032b}"[::-1], 2)
+
+
+# The first packet of a logical stream names its codec.
+_OGG_CODECS = (
+    (b"OpusHead", "opus"), (b"\x01vorbis", "vorbis"), (b"\x80theora", "theora"),
+    (b"Speex   ", "speex"), (b"\x7fFLAC", "flac"),
+)
+
+
+def _ogg_length(stream, offset, caps):
+    """Walk Ogg pages to the end of the streams they began.
+
+    Each page records its own size and a CRC over its bytes, so the walk checks
+    every page, and stops at the page that sets the end-of-stream flag on the
+    last open stream. Streams that start together (grouped) all count; a new
+    stream that starts after those have ended is chained, and RFC 3533 requires
+    a group to stand on its own once unchained, so the file is taken to end
+    there and the next group is reported separately.
+
+    Not every writer sets the end-of-stream flag: 9 of the 27 distinct Ogg Opus
+    files in one public Android 13 image (hickman_a13) end on a clean page
+    boundary with every CRC good and no such page. So a page that fails its CRC,
+    breaks its stream's page sequence, or is not a page at all ends the file at
+    the last page that checked, rather than rejecting it. Every byte reported
+    has passed a CRC as part of this file; a file that was damaged or overwritten
+    part way comes back as the part before the damage.
+
+    A page cut off by the end of the stream returns the length the page declares,
+    which carve() then cuts to the stream and reports as capped. The first page
+    is never taken on trust: it has to be whole and pass its CRC, or nothing is
+    reported.
+
+    The codec is only known once the walk is done, so the walk runs to the larger
+    of the "ogg" and "ogv" ceilings and the kind's own ceiling is applied after.
+    """
+    pos = offset
+    end = offset + max(_cap(caps, "ogg"), _cap(caps, "ogv"))
+    expect = {}                                   # serial -> next page sequence
+    ended = 0
+    grouping = True
+    codecs = []
+    cut = None                                    # a page the stream cut short
+    while pos < end:
+        head = _read_at(stream, pos, 27)
+        if len(head) < 27:
+            if head and expect:
+                cut = pos + 27
+            break
+        if head[:4] != b"OggS" or head[4] != 0 or head[5] & ~0x07:
+            break
+        flags = head[5]
+        serial, seq = struct.unpack("<II", head[14:22])
+        nseg = head[26]
+        table = _read_at(stream, pos + 27, nseg)
+        size = 27 + nseg + sum(table)
+        page = _read_at(stream, pos, size)
+        if len(page) < size:
+            if expect:
+                cut = pos + size
+            break
+        stored = struct.unpack("<I", page[22:26])[0]
+        if _ogg_crc(page[:22] + b"\x00\x00\x00\x00" + page[26:]) != stored:
+            break
+        if flags & 0x02:                          # first page of a stream
+            if not grouping or serial in expect or seq != 0 or flags & 0x01:
+                break
+            body = page[27 + nseg:]
+            codecs.append(next((name for magic, name in _OGG_CODECS
+                                if body.startswith(magic)), "other"))
+            expect[serial] = 1
+        else:
+            if not expect or expect.get(serial) != seq:
+                break
+            grouping = False
+            expect[serial] = seq + 1
+        pos += size
+        if flags & 0x04:                          # last page of a stream
+            expect[serial] = None
+            ended += 1
+            if ended == len(expect):
+                break
+    if not expect:
+        return None                               # not even a first page checked
+    if cut is not None:
+        pos = cut
+    length = pos - offset
+    if "theora" in codecs:
+        kind, ext = "ogv", ".ogv"
+    elif codecs == ["opus"] * len(codecs):
+        kind, ext = "ogg", ".opus"
+    elif codecs == ["speex"] * len(codecs):
+        kind, ext = "ogg", ".spx"
+    elif codecs == ["flac"] * len(codecs):
+        kind, ext = "ogg", ".oga"
+    else:
+        kind, ext = "ogg", ".ogg"
+    if length > _cap(caps, kind):
+        return _cap(caps, kind), "capped", kind, ext
+    return length, "parsed", kind, ext
+
+
+# AMR storage frame sizes in bytes, frame header included, by frame type (FT),
+# as FFmpeg's demuxer has them (libavformat/amr.c at n7.1). Only the frame types
+# RFC 4867 allows in a storage file are listed: speech modes, SID and NO_DATA,
+# plus SPEECH_LOST for AMR-WB. FT 9 to 11 "SHALL NOT be used" in AMR files
+# (section 5.3), and the rest are reserved.
+_AMR_NB_SIZES = {0: 13, 1: 14, 2: 16, 3: 18, 4: 20, 5: 21, 6: 27, 7: 32, 8: 6, 15: 1}
+_AMR_WB_SIZES = {0: 18, 1: 24, 2: 33, 3: 37, 4: 41, 5: 47, 6: 51, 7: 59, 8: 61,
+                 9: 6, 14: 1, 15: 1}
+
+
+def _amr_length(stream, offset, cap):
+    """Walk AMR storage frames to the first byte that cannot be a frame header.
+
+    An AMR file records no length and has no terminator, so its end is where the
+    frames stop. A frame header is |P|FT|Q|P|P| with the P bits written as zero
+    (RFC 4867, section 5.3), and FT must be one of the types listed above. A frame
+    of all zero bytes also ends the walk: its header would say FT 0 with the Q bit
+    clear, which is a damaged frame an encoder does not write, and zeros are what
+    unwritten space holds. Bytes that follow a file can still happen to parse as a
+    few frames, so the length can run a little past the real end.
+    """
+    head = _read_at(stream, offset, 9)
+    if head.startswith(b"#!AMR-WB\n"):
+        sizes, pos, ext = _AMR_WB_SIZES, offset + 9, ".awb"
+    elif head.startswith(b"#!AMR\n"):
+        sizes, pos, ext = _AMR_NB_SIZES, offset + 6, ".amr"
+    else:
+        return None
+    end = offset + cap
+    buf, buf_at = b"", pos
+    while pos < end:
+        if pos + 61 > buf_at + len(buf):          # keep a whole frame in hand
+            buf_at = pos
+            buf = _read_at(stream, pos, 1 << 16)
+        i = pos - buf_at
+        if i >= len(buf):
+            break
+        frame_header = buf[i]
+        if frame_header & 0x83:
+            break
+        size = sizes.get(frame_header >> 3 & 0x0F)
+        if size is None:
+            break
+        frame = buf[i:i + size]
+        if len(frame) < size or not any(frame):
+            break
+        pos += size
+    return pos - offset, "parsed", "amr", ext
 
 
 # ------------------------------------------------------------------ scanning
@@ -364,17 +598,24 @@ def _measure(stream, offset, kind, caps):
         got = _riff_length(stream, offset, caps)
     elif kind == "bmff":
         got = _bmff_length(stream, offset, caps)
+    elif kind == "ogg":
+        got = _ogg_length(stream, offset, caps)
+    elif kind == "amr":
+        got = _amr_length(stream, offset, _cap(caps, kind))
     else:
         return None
     if got is None:
         return None
-    if len(got) == 3:
+    ext = None
+    if len(got) == 4:
+        length, bounded, kind, ext = got
+    elif len(got) == 3:
         length, bounded, kind = got
     else:
         length, bounded = got
     if length < MIN_LENGTHS.get(kind, 1):
         return None
-    return Candidate(offset, length, kind, EXTENSIONS.get(kind, ".bin"), bounded)
+    return Candidate(offset, length, kind, ext or EXTENSIONS.get(kind, ".bin"), bounded)
 
 
 def carve(stream, *, kinds=None, caps=None, start=0, end=None,
@@ -416,6 +657,10 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                 kind = "bmff"
             elif sig == b"RIFF":
                 kind = "riff"
+            elif sig.startswith(b"OggS"):
+                kind = "ogg"
+            elif sig.startswith(b"#!AMR"):
+                kind = "amr"
             elif sig.startswith(b"\xff\xd8"):
                 kind = "jpeg"
             elif sig.startswith(b"\x89PNG"):
@@ -529,6 +774,8 @@ def _kinds_arg(value):
             wanted |= set(IMAGE_KINDS)
         elif part in ("video", "videos"):
             wanted |= set(VIDEO_KINDS)
+        elif part == "audio":
+            wanted |= set(AUDIO_KINDS)
         elif part:
             wanted.add(part)
     return wanted or None
@@ -575,7 +822,7 @@ def _cmd_carve(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="mediacarve",
-        description="Recover images and video from a disk image by signature. "
+        description="Recover images, video and audio from a disk image by signature. "
                     "Read only.")
     ap.add_argument("--version", action="version", version=f"mediacarve {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -583,7 +830,7 @@ def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("image", help="raw image, or an .E01 when ewfprobe is present")
     common.add_argument("-k", "--kinds", default=None,
-                        help="limit to these kinds: images, video, or a comma "
+                        help="limit to these kinds: images, video, audio, or a comma "
                              "separated list such as jpeg,png,mp4")
     common.add_argument("--nested", action="store_true",
                         help="also report files inside another file, such as "

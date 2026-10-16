@@ -1,6 +1,6 @@
 # mediacarve
 
-Recover images and video from any stream of bytes, by signature. One file, pure
+Recover images, video and audio from any stream of bytes, by signature. One file, pure
 Python, standard library only. No compiler, no network, nothing to install.
 
 ```python
@@ -66,6 +66,7 @@ mediacarve list  disk.raw -v                 # one line per file
 mediacarve carve disk.raw -o carved/         # write the files out
 mediacarve carve disk.raw -o carved.zip      # or into a zip
 mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic
+mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr
 ```
 
 ## Lengths are parsed, not guessed
@@ -84,6 +85,19 @@ matters because an EXIF thumbnail is a whole JPEG inside the APP1 segment: the
 segment's own length steps over it, so the thumbnail neither truncates the file
 nor gets reported as a second one. PNG sums chunks to IEND, GIF walks blocks to
 the trailer, and RIFF and ISO-BMFF read their own recorded sizes.
+
+Ogg walks its pages and checks each one's CRC, the page sequence of each stream,
+and the end-of-stream flag. Not every writer sets that flag, so a file ends at the
+last page that checks, and every byte reported has passed a CRC as part of the
+file. A file damaged or overwritten part way comes back as the part before the
+damage.
+
+AMR records no length and has no terminator, so its frames are walked until a
+byte cannot be a frame header (RFC 4867, section 5.3) or a frame is all zeros.
+Bytes after the file can happen to parse as a few more frames, and a file whose
+last frame is cut short takes the bytes that complete it. Laid into random bytes,
+448 of 500 copies of the AMR fixture came back exactly and the longest ran 47
+bytes over.
 
 A recorded size is only what the bytes say, so three limits apply and a hit cut
 at one is reported as `capped`:
@@ -112,10 +126,31 @@ replacing it: carving is the floor that still works on a filesystem nobody has
 written a parser for, and a parser is what turns anonymous blobs into named,
 dated, path-anchored files.
 
-Formats covered are JPEG, PNG, GIF, WebP, AVI, ISO-BMFF video (MP4, MOV, 3GP)
-and ISO-BMFF stills (HEIC, HEIF, AVIF). BMP and TIFF are not covered: BMP's
-signature is two bytes and TIFF's length is not in its header, so both would cost
-more in false positives than they return.
+## Kinds and extensions
+
+| kind | formats | extension |
+| --- | --- | --- |
+| `jpeg`, `png`, `gif`, `webp` | the format of that name | `.jpg`, `.png`, `.gif`, `.webp` |
+| `avi` | AVI | `.avi` |
+| `mp4` | ISO-BMFF video | from the brand: `.mov`, `.3gp`, `.3g2`, `.m4v`, otherwise `.mp4` |
+| `heic` | ISO-BMFF stills | from the brands: `.heic`, `.avif`, otherwise `.heif` |
+| `m4a` | ISO-BMFF with an iTunes audio brand | `.m4a`, `.m4b`, `.m4p` |
+| `ogg` | Ogg audio | from the codec: `.opus`, `.spx`, `.oga` (FLAC), otherwise `.ogg` |
+| `ogv` | Ogg with a Theora stream | `.ogv` |
+| `amr` | AMR and AMR-WB storage files | `.amr`, `.awb` |
+
+`-k images`, `-k video` and `-k audio` select the groups. The brand is read from
+the `ftyp` box against the [MP4 registration authority's list](https://github.com/mp4ra/mp4ra.github.io/blob/35c6ffec3216d1d0d50671a68509ec4ddbf3c9b5/data/brands.csv).
+A brand only says what the writer declared: an audio-only file written with the
+generic `mp42` brand is reported as `mp4`, and 29 of 59 distinct `.m4a` files
+from two public Android images were written that way.
+
+Single-channel AMR only. The multi-channel AMR headers, AMR inside 3GP (that is
+ISO-BMFF, and carves as `mp4`), and SILK voice files (`#!SILK_V3`), which one public
+Android image stores under `com.tencent.mm` with an `.amr` name, are not covered.
+
+BMP and TIFF are not covered: BMP's signature is two bytes and TIFF's length is
+not in its header, so both would cost more in false positives than they return.
 
 ## How it was validated
 
@@ -161,6 +196,46 @@ volume where the scan reports 8 MP4 files: 4 came back short by exactly their
 259 hits on that volume, and all 2,861 on two more test volumes, were the same
 in both.
 
+**Audio from real devices.** 260 distinct audio and video files taken from five
+public images (`pixel3_a11`, `hickman_a13`, `galaxys10_a10`, `kevin_pocox7_a15`,
+`ctf2020_ios12`) were laid into an 8.4 MiB image between runs of zeros, and again
+between runs of random bytes. ffprobe named each file's format first. In zeros,
+251 of the 252 that are formats mediacarve covers came back at their offset with
+a matching SHA-256 and the expected kind and extension: 179 Ogg Opus, 1 Ogg
+Vorbis, 30 M4A, 33 MP4, 1 3GP and 7 of 8 AMR. The eighth AMR came back one byte
+long: its last frame is a 32-byte frame with 31 bytes in the file, and the byte
+after it completes it. The
+8 SILK files gave no hit. In random bytes the same 244 that are not AMR came back
+exactly, and 6 of the 8 AMR; the other two ran 1 and 6 bytes long. Neither image
+gave a hit anywhere else.
+
+Two defects were found that way, and both are pinned as tests. Requiring an
+end-of-stream page missed 9 of the 27 distinct Ogg Opus files from `hickman_a13`,
+which end cleanly without one. And in random bytes, one MP4 ran 3.97 MB past its
+end: the four printable bytes `sIs}` after it passed for a vendor box declaring
+4,265,331,032 bytes, and the extent hid 106 of the files above. 0.2.0 reports the
+same extent. A
+vendor box now has to be followed by another box, or by the end of the stream.
+
+**Against 0.2.0.** On five constructed volumes in the corpus (`takeout-exfat`,
+`takeout-fat32`, `windows-ntfs`, `macos-apfs` and `android-root-ext4` from the
+raw image fixtures), every extent 0.2.0 reported came back the same but one. On
+`macos-apfs`, 0.2.0 reported an MP4 at 1.86 GB, cut at the end of the image,
+because a 2.6 GB vendor "box" `dlm(` followed it. It is now 213,936 bytes, the sum
+of its `ftyp`, `moov`, `free` and `mdat`, and the 5,121 files the long extent hid
+are reported. One MP4 hit there is now `.mov`. New on the others: 58 Ogg Vorbis and one Ogg Theora video, all of
+which decode in FFmpeg without an error. 21 stills are now `.avif` and decode as
+AV1, and one `mp4` is now `m4a`.
+
+**Controls.** For the audio kinds, each of these was broken in turn and made its
+own test fail: the Ogg CRC check, the page sequence check, the rule that first
+pages come before any other, taking a first page cut off by the end of the stream
+on trust, ignoring that cut, the AMR padding bits, the AMR frame types a storage
+file may carry, the all-zero frame rule, the AMR length floor, the brand to
+extension mapping, reading the compatible brands, and the rule that a vendor box
+is followed by a box. Ending the walk at the end-of-stream page is not one of
+them: whatever follows that page ends the walk at the same byte anyway.
+
 ## Tests
 
 ```
@@ -173,8 +248,10 @@ The media fixtures are regenerated with:
 python tools/make_fixtures.py tests/fixtures/media
 ```
 
-That tool uses Pillow, piexif and OpenCV and is for development only. None of
-them ships or is imported by `mediacarve`, and the test suite reads only the
+That tool uses Pillow, piexif, OpenCV, FFmpeg, the opencore-amr and vo-amrwbenc
+encoders, and on macOS `sips`, and is for development only. `--only av` writes the
+audio and other video fixtures alone and keeps the rest. None of them ships or is
+imported by `mediacarve`, and the test suite reads only the
 committed output, so running the tests needs nothing but pytest.
 
 ## License
