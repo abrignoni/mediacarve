@@ -111,6 +111,34 @@
       "ext": ".avif",
       "length": 1830,
       "sha256": "a02ef6f42b68d2644bd17a4104311ac3ff8fb8b6b511bd8ddfb0e22f17ea7af8"
+    },
+    {
+      "name": "plain.wav",
+      "kind": "wav",
+      "ext": ".wav",
+      "length": 8044,
+      "sha256": "9c2442dd7eb8824ed5eefee52d475b124fd89ed7160cb6bcbc54f00392cdfd56"
+    },
+    {
+      "name": "plain.aiff",
+      "kind": "aiff",
+      "ext": ".aiff",
+      "length": 12096,
+      "sha256": "b3c26f80204fa8f7a6307c876b0001467fcc9e48d8e596c17a8056b57be5d050"
+    },
+    {
+      "name": "plain.aifc",
+      "kind": "aiff",
+      "ext": ".aifc",
+      "length": 6238,
+      "sha256": "d9ea4751d429256b2e32a8b5863c0df289f0ec34d405ba89d6ab5add093777db"
+    },
+    {
+      "name": "plain.caf",
+      "kind": "caf",
+      "ext": ".caf",
+      "length": 5394,
+      "sha256": "0259c3ad30a03d001ed4b3351b09e142f6af851c12b1f6d19c6fcf0562957c2b"
     }
   ]
 }

@@ -49,7 +49,7 @@ import zipfile
 import zlib
 from typing import NamedTuple
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # How much to read at a time while scanning, and how much to carry over so a
 # signature straddling two blocks is still found.
@@ -72,6 +72,9 @@ DEFAULT_CAPS = {
     "ogg": 1 << 30,
     "ogv": 4 << 30,
     "amr": 64 << 20,
+    "wav": 4 << 30,
+    "aiff": 4 << 30,
+    "caf": 4 << 30,
 }
 _ABSOLUTE_CAP = 4 << 30
 
@@ -84,6 +87,7 @@ MIN_LENGTHS = {
     "jpeg": 128, "png": 57, "gif": 64, "webp": 64,
     "avi": 1024, "mp4": 1024, "heic": 512,
     "m4a": 1024, "ogg": 128, "ogv": 1024, "amr": 256,
+    "wav": 64, "aiff": 64, "caf": 64,
 }
 
 # The conventional extension for each kind. ISO-BMFF, Ogg and AMR refine it from
@@ -92,11 +96,12 @@ EXTENSIONS = {
     "jpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp",
     "avi": ".avi", "mp4": ".mp4", "heic": ".heic",
     "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "amr": ".amr",
+    "wav": ".wav", "aiff": ".aiff", "caf": ".caf",
 }
 
 IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic"})
 VIDEO_KINDS = frozenset({"avi", "mp4", "ogv"})
-AUDIO_KINDS = frozenset({"m4a", "ogg", "amr"})
+AUDIO_KINDS = frozenset({"m4a", "ogg", "amr", "wav", "aiff", "caf"})
 
 
 class Candidate(NamedTuple):
@@ -127,7 +132,9 @@ _SCAN = re.compile(
     b"|RIFF"                     # RIFF container, form checked below
     b"|ftyp"                     # ISO-BMFF, four bytes in
     b"|OggS\x00[\x02\x06]"       # Ogg page, version 0, first of its stream
-    b"|#!AMR(?:-WB)?\n",          # single-channel AMR or AMR-WB storage file
+    b"|#!AMR(?:-WB)?\n"           # single-channel AMR or AMR-WB storage file
+    b"|FORM....AIF[FC]"          # IFF FORM holding AIFF or AIFF-C
+    b"|caff\x00\x01\x00\x00",     # CAF version 1, flags 0
     re.DOTALL)
 
 # Top-level ISO-BMFF box types the carver knows. A file has to show at least one
@@ -167,18 +174,31 @@ def _read_at(stream, offset, size):
 
 # ------------------------------------------------------------ length finding
 
+# Start-of-frame markers, ITU-T T.81 Table B.1: SOF0 to SOF15 less DHT (C4),
+# JPG (C8) and DAC (CC).
+_JPEG_SOF = frozenset(set(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC})
+
+
 def _jpeg_length(stream, offset, cap):
     """Walk JPEG markers to the end-of-image marker.
 
     Walking rather than searching for FFD9 matters: an EXIF thumbnail is a whole
     JPEG inside the APP1 segment, and the segment's own length field steps over
     it, so the thumbnail's end marker is never mistaken for the file's.
+
+    A scan is only taken after a frame header (SOFn), with a scan header of the
+    length ITU-T T.81 fixes: 6 + 2 x Ns bytes for Ns from 1 to 4 (Table B.3;
+    the frame header comes first, Figure B.2). Measured on raw audio from public
+    phone images: three runs of bytes that went straight from FFD8FF to an FFDA
+    "scan" about 65,500 bytes long ended 65 KB later at an FFD9, decode as
+    nothing, and one of them hid a WAV file behind it.
     """
     pos = offset + 2
     end = offset + cap
     saw_scan = False
+    saw_frame = False
     while pos < end:
-        head = _read_at(stream, pos, 4)
+        head = _read_at(stream, pos, 5)
         if len(head) < 2 or head[0] != 0xFF:
             return None
         marker = head[1]
@@ -196,6 +216,12 @@ def _jpeg_length(stream, offset, cap):
         seg = struct.unpack(">H", head[2:4])[0]
         if seg < 2:
             return None
+        if marker in _JPEG_SOF:
+            saw_frame = True
+        elif marker == 0xDA:
+            if not saw_frame or len(head) < 5 or not 1 <= head[4] <= 4 \
+                    or seg != 6 + 2 * head[4]:
+                return None                      # not a scan header T.81 allows
         pos += 2 + seg
         if marker == 0xDA:                       # start of scan: entropy follows
             saw_scan = True
@@ -336,11 +362,34 @@ def _cap(caps, kind):
 _WEBP_FIRST = frozenset({b"VP8 ", b"VP8L", b"VP8X"})
 
 
+def _chunks_hold(stream, pos, end, fmt, required):
+    """True when walking chunks from ``pos`` finds every chunk ID in ``required``.
+
+    RIFF and IFF chunks are an ID of four printable bytes, a size and the data,
+    padded to an even length. The walk stops at the first ID that is not
+    printable or the first size that runs past ``end``, so it vouches for the
+    chunks it reached, not for the container's size.
+    """
+    need = set(required)
+    while need and pos + 8 <= end:
+        head = _read_at(stream, pos, 8)
+        if len(head) < 8 or not all(0x20 <= b < 0x7F for b in head[:4]):
+            return False
+        size = struct.unpack(fmt, head[4:8])[0]
+        need.discard(head[:4])
+        pos += 8 + size + (size & 1)
+        if pos > end + 1:                         # a missing final pad is common
+            break
+    return not need
+
+
 def _riff_length(stream, offset, caps):
     """RIFF records its own size, so the extent is exact once the form checks.
 
     The size is only as good as the header, so the form's first chunk has to be
-    the one its specification requires, and has to fit inside the size. Measured
+    the one its specification requires, and has to fit inside the size. A WAVE
+    can open with JUNK, bext or LIST as well as fmt, so for it the chunks are
+    walked until both fmt and data have been seen. Measured
     on an Android system partition: "RIFF", a size and "AVI " followed by
     timezone abbreviations was taken as a 774,778,422-byte AVI, and hid 455 files
     that PhotoRec recovered.
@@ -355,10 +404,15 @@ def _riff_length(stream, offset, caps):
         kind = "avi"
     elif form == b"WEBP" and first in _WEBP_FIRST:
         kind = "webp"
+    elif form == b"WAVE":
+        kind = "wav"
     else:
         return None
     total = size + 8
     if total < 16 or total > _cap(caps, kind) or 20 + first_size > total:
+        return None
+    if kind == "wav" and not _chunks_hold(stream, offset + 12, offset + total,
+                                          "<I", {b"fmt ", b"data"}):
         return None
     return total, "header", kind
 
@@ -480,6 +534,82 @@ def _bmff_length(stream, offset, caps):
     if length > cap:
         return cap, "capped", kind, ext
     return length, "header", kind, ext
+
+def _iff_length(stream, offset, caps):
+    """An AIFF or AIFF-C FORM records its own size, big-endian, like RIFF.
+
+    AIFF 1.3 puts no order on the chunks in a FORM but requires the Common chunk,
+    COMM, so the chunks are walked until it is found. Measured on 604 AIFF and
+    AIFF-C files from public phone images: in 594 the FORM size is the file's
+    size and the chunks fill it exactly.
+    """
+    head = _read_at(stream, offset, 12)
+    if len(head) < 12:
+        return None
+    total = struct.unpack(">I", head[4:8])[0] + 8
+    ext = ".aifc" if head[8:12] == b"AIFC" else ".aiff"
+    if total < 20 or total > _cap(caps, "aiff"):
+        return None
+    if not _chunks_hold(stream, offset + 12, offset + total, ">I", {b"COMM"}):
+        return None
+    return total, "header", "aiff", ext
+
+
+# The chunk types Apple's Core Audio Format specification defines, by table.
+_CAF_CHUNKS = frozenset({
+    b"desc", b"data", b"pakt", b"chan", b"kuki", b"strg", b"mark", b"regn",
+    b"inst", b"midi", b"ovvw", b"peak", b"edct", b"info", b"umid", b"uuid",
+    b"free",
+})
+
+
+def _caf_length(stream, offset, caps):
+    """Walk CAF chunks until one is not a type the specification defines.
+
+    A CAF file records no total size. Its chunks each carry a 64-bit size, the
+    Audio Description chunk comes first, and the Audio Description and Audio
+    Data chunks are required, so the file ends where the chunks stop. Measured
+    on 2,049 CAF files from public phone images: in 1,474 the walk ends exactly
+    at the end of the file. In 66 an info chunk declares one byte less than it
+    holds, so the walk stops there; the audio data comes before it in all 66,
+    and 45 to 267 bytes of chunks after it are left out.
+
+    The specification lets the Audio Data chunk give its size as -1, unknown, if
+    it is the last chunk. A carver cannot see where such a file ends, so the walk
+    stops there, before the data chunk counts, and the file is not reported. Measured: 503 of the 2,049 do this, all but one uncompressed,
+    and every such file in two public iOS images, 986 in all, is one of Apple's
+    text-to-speech voice assets under MobileAsset.
+
+    A chunk after the Audio Data chunk that runs past the end of the stream is
+    taken as not part of the file: it is far more likely to be four letters of
+    whatever followed than a chunk cut off by the end of the image.
+    """
+    stream.seek(0, os.SEEK_END)
+    stream_end = stream.tell()
+    end = offset + _cap(caps, "caf")
+    pos = offset + 8
+    saw_desc = saw_data = False
+    while pos < end:
+        head = _read_at(stream, pos, 12)
+        if len(head) < 12 or head[:4] not in _CAF_CHUNKS:
+            break
+        ctype = head[:4]
+        size = struct.unpack(">q", head[4:12])[0]
+        if not saw_desc:
+            if ctype != b"desc" or size != 32:
+                return None
+            saw_desc = True
+        if size < 0:
+            break                                 # -1 on data: an end nobody recorded
+        if saw_data and pos + 12 + size > stream_end:
+            break
+        pos += 12 + size
+        if ctype == b"data":
+            saw_data = True
+    if not saw_data:
+        return None
+    return pos - offset, "parsed", "caf", ".caf"
+
 
 # Ogg pages carry a CRC-32 with the generator polynomial 0x04c11db7 (RFC 3533,
 # section 6), computed MSB first with a zero start and no final inversion, over
@@ -660,6 +790,10 @@ def _measure(stream, offset, kind, caps):
         got = _ogg_length(stream, offset, caps)
     elif kind == "amr":
         got = _amr_length(stream, offset, _cap(caps, kind))
+    elif kind == "iff":
+        got = _iff_length(stream, offset, caps)
+    elif kind == "caf":
+        got = _caf_length(stream, offset, caps)
     else:
         return None
     if got is None:
@@ -724,6 +858,10 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                 kind = "ogg"
             elif sig.startswith(b"#!AMR"):
                 kind = "amr"
+            elif sig.startswith(b"FORM"):
+                kind = "iff"
+            elif sig.startswith(b"caff"):
+                kind = "caf"
             elif sig.startswith(b"\xff\xd8"):
                 kind = "jpeg"
             elif sig.startswith(b"\x89PNG"):

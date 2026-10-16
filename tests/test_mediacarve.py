@@ -191,10 +191,11 @@ def test_a_long_jpeg_with_no_scan_is_still_rejected():
 
 
 def test_a_scan_bearing_jpeg_below_the_floor_is_rejected():
-    """Isolates the length floor: this one does have a scan segment, so only the
-    floor stands between it and being reported as a fourteen-byte JPEG."""
-    sos = b"\xff\xda" + struct.pack(">H", 8) + b"\x00" * 6
-    stream = _image([(4096, b"\xff\xd8" + sos + b"\xff\xd9")])
+    """Isolates the length floor: this one has a frame header and a well-formed
+    scan, so only the floor stands between it and a 27-byte JPEG."""
+    sof = b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, 1, 1, 1) + b"\x01\x11\x00"
+    sos = b"\xff\xda" + struct.pack(">HB", 8, 1) + b"\x01\x00\x00\x3f\x00"
+    stream = _image([(4096, b"\xff\xd8" + sof + sos + b"\xff\xd9")])
     assert list(mediacarve.carve(stream)) == []
 
 
@@ -424,6 +425,117 @@ def test_a_webp_must_open_with_a_vp8_chunk():
     png = _load("plain.png")
     stream = _image([(4096, fake), (65536, png)], size=1 << 20)
     assert [(h.offset, h.kind) for h in mediacarve.carve(stream)] == [(65536, "png")]
+
+
+
+# ---------------------------------------------------------------- jpeg scans
+
+def _jpeg_segments(data):
+    """(marker, start, length) for each segment before the first scan."""
+    out, pos = [], 2
+    while True:
+        marker, seg = data[pos + 1], struct.unpack(">H", data[pos + 2:pos + 4])[0]
+        out.append((marker, pos, seg))
+        if marker == 0xDA:
+            return out
+        pos += 2 + seg
+
+
+def test_a_scan_with_no_frame_header_is_not_a_jpeg():
+    """Measured on raw audio from public phone images: FFD8FF straight into an
+    FFDA "scan" about 65,500 bytes long, ending 65 KB later at an FFD9. ITU-T
+    T.81 puts the frame header first (Figure B.2). One such run hid a WAV."""
+    fake = b"\xff\xd8\xff\xda" + struct.pack(">H", 65502) + b"\x11" * 65500 + b"\xff\xd9"
+    wav = _load("plain.wav")
+    stream = _image([(4096, fake[:30000]), (4096 + 30000, wav), (4096 + 30000 + len(wav), fake[30000:])])
+    assert [(h.offset, h.kind) for h in mediacarve.carve(stream)] == [(4096 + 30000, "wav")]
+    # a scan header T.81 allows, but no frame header before it
+    sos = b"\xff\xda" + struct.pack(">HB", 8, 1) + b"\x01\x00\x00\x3f\x00"
+    no_frame = b"\xff\xd8" + sos + b"\x11" * 4000 + b"\xff\xd9"
+    assert list(mediacarve.carve(_image([(4096, no_frame)]))) == []
+
+
+def test_a_scan_header_of_the_wrong_length_is_not_a_jpeg():
+    """T.81 Table B.3: a scan header is 6 + 2 x Ns bytes, Ns from 1 to 4."""
+    data = bytearray(_load("plain.jpg"))
+    marker, at, seg = _jpeg_segments(bytes(data))[-1]
+    assert marker == 0xDA
+    data[at + 4] = 5                              # Ns out of range, with its
+    data[at + 2:at + 4] = struct.pack(">H", 16)   # matching length of 6 + 2 x 5
+    assert list(mediacarve.carve(_image([(4096, bytes(data))]))) == []
+    data = bytearray(_load("plain.jpg"))
+    data[at + 2:at + 4] = struct.pack(">H", seg + 2)   # length that does not match Ns
+    assert list(mediacarve.carve(_image([(4096, bytes(data))]))) == []
+
+
+# ------------------------------------------------------- wav, aiff and caf
+
+def test_a_wav_without_fmt_and_data_is_not_a_wav():
+    body = b"WAVE" + b"LIST" + struct.pack("<I", 4) + b"INFO" + b"\x00" * 400
+    fake = b"RIFF" + struct.pack("<I", len(body)) + body
+    assert list(mediacarve.carve(_image([(4096, fake)]))) == []
+
+
+def test_a_wav_whose_size_is_a_placeholder_is_not_reported():
+    """Measured: 2 of 1,247 real WAVs carry RIFF and data sizes of 0xFFFFFFFF,
+    a streaming writer's "unknown". The end cannot be found, so no hit."""
+    wav = bytearray(_load("plain.wav"))
+    wav[4:8] = b"\xff\xff\xff\xff"
+    png = _load("plain.png")
+    stream = _image([(4096, bytes(wav)), (65536, png)])
+    assert [(h.offset, h.kind) for h in mediacarve.carve(stream)] == [(65536, "png")]
+
+
+def test_an_aiff_needs_its_common_chunk():
+    aiff = bytearray(_load("plain.aiff"))
+    at = aiff.find(b"COMM")
+    aiff[at:at + 4] = b"COMX"
+    assert list(mediacarve.carve(_image([(4096, bytes(aiff))]))) == []
+    # another IFF form, even one holding a COMM chunk, is not AIFF
+    body = b"8SVX" + aiff[12:]
+    other = b"FORM" + struct.pack(">I", len(body)) + body.replace(b"COMX", b"COMM")
+    assert list(mediacarve.carve(_image([(4096, other)]))) == []
+
+
+def test_a_caf_must_open_with_its_description_chunk():
+    caf = _load("plain.caf")
+    swapped = caf[:8] + b"free" + caf[12:]       # first chunk no longer desc
+    assert list(mediacarve.carve(_image([(4096, swapped)]))) == []
+
+
+def _caf_chunks(data):
+    out, pos = [], 8
+    while pos + 12 <= len(data):
+        size = struct.unpack(">q", data[pos + 4:pos + 12])[0]
+        out.append((data[pos:pos + 4], pos, size))
+        pos += 12 + size
+    return out
+
+
+def test_a_caf_whose_data_size_is_unknown_is_not_reported():
+    """Apple's spec lets the data chunk say -1 when it is last. Measured: 503 of
+    2,049 real CAF files do, and every such file in two public iOS images, 986
+    in all, is a text-to-speech voice asset. Where they end cannot be found."""
+    caf = bytearray(_load("plain.caf"))
+    t, at, size = _caf_chunks(bytes(caf))[-1]
+    assert t == b"data"
+    caf[at + 4:at + 12] = struct.pack(">q", -1)
+    png = _load("plain.png")
+    stream = _image([(4096, bytes(caf)), (65536, png)])
+    assert [(h.offset, h.kind) for h in mediacarve.carve(stream)] == [(65536, "png")]
+
+
+def test_a_caf_ends_where_its_chunks_stop():
+    """CAF records no total size. The walk ends at the first chunk type the
+    spec does not define, or at a listed type whose size runs past the stream,
+    which is text after the file far more often than a chunk cut short."""
+    caf = _load("plain.caf")
+    text = b"free" + struct.pack(">q", 1 << 40) + b" and other words that follow " * 4
+    png = _load("plain.png")
+    for tail in (b"\x00ID3 trailing metadata, one byte off" * 3, text):
+        stream = _image([(4096, caf + tail), (65536, png)], size=1 << 20)
+        assert [(h.offset, h.length, h.kind) for h in mediacarve.carve(stream)] \
+            == [(4096, len(caf), "caf"), (65536, len(png), "png")]
 
 
 
