@@ -261,6 +261,23 @@ def test_random_bytes_after_a_file_are_not_a_vendor_box():
         == [(4096, len(clip), "mp4"), (65536, len(jpg), "jpeg")]
 
 
+def test_text_after_a_file_is_not_a_vendor_box():
+    """Measured on a macOS volume: after a real uuid box, four spaces sized
+    0x20202020 passed for a vendor box, because the text after them also had the
+    shape of a box header. The extent hid 179 files. A vendor box has to be
+    followed by a box the carver knows."""
+    clip = (_box(b"ftyp", b"mp42\x00\x00\x00\x00mp42isom") + _box(b"moov", b"m" * 200)
+            + _box(b"uuid", b"u" * 64) + _box(b"mdat", b"d" * 3000))
+    # a "box" of four spaces, then text with the shape of a box header where
+    # that box would end: both fit in the image, so only the rule can say no
+    text = (struct.pack(">I", 256) + b"    " + b"t" * 248
+            + struct.pack(">I", 64) + b"lass" + b"t" * 600)
+    png = _load("plain.png")
+    stream = _image([(4096, clip + text), (65536, png)], size=1 << 20)
+    assert [(h.offset, h.length, h.kind) for h in mediacarve.carve(stream)] \
+        == [(4096, len(clip), "mp4"), (65536, len(png), "png")]
+
+
 def test_ftyp_followed_only_by_unknown_boxes_is_still_not_a_file():
     """Skipping vendor boxes must not let ftyp plus nothing it recognises through:
     the file still has to show a box the carver knows."""
@@ -279,6 +296,134 @@ def test_bytes_that_are_not_a_box_still_end_the_file():
     stream = _image([(4096, clip + junk)])
     hits = [h for h in mediacarve.carve(stream) if h.kind == "mp4"]
     assert [(h.offset, h.length) for h in hits] == [(4096, len(clip))]
+
+
+
+# ----------------------------------------------------------------------- png
+
+def _chunk(ctype: bytes, data: bytes = b"") -> bytes:
+    import zlib
+    return struct.pack(">I", len(data)) + ctype + data + struct.pack(">I", zlib.crc32(ctype + data))
+
+
+def _tiny_png(iend: bytes = None) -> bytes:
+    """A valid 1x1 grey PNG, 67 bytes, built to the specification."""
+    import zlib
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(b"\x00\x80")) + (iend or _chunk(b"IEND")))
+
+
+def test_a_png_under_the_old_floor_is_recovered():
+    """Measured on a Windows volume: 38 real PNGs of 68 to 127 bytes were under
+    the 128-byte floor. The CRCs are what make a floor that low safe."""
+    png = _tiny_png()
+    assert len(png) < 128
+    stream = _image([(4096, png)])
+    assert [(h.offset, h.length, h.kind) for h in mediacarve.carve(stream)] \
+        == [(4096, len(png), "png")]
+
+
+def test_an_iend_that_declares_data_does_not_swallow_what_follows():
+    """Measured on a Windows volume: two small PNGs whose IEND declared 150,994,944
+    and 589,824 bytes ran on and hid 14 PNGs. IEND's data field is empty."""
+    bad = _tiny_png(iend=struct.pack(">I", 589_824) + b"IEND" + b"\xaeB`\x82")
+    real = _load("plain.png")
+    stream = _image([(4096, bad), (8192, real)], size=1 << 20)
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream)] == [(8192, len(real))]
+    # an IEND carrying data under a good CRC: only the empty-IEND rule rejects it
+    data_iend = _tiny_png(iend=_chunk(b"IEND", b"tail"))
+    stream = _image([(4096, data_iend), (8192, real)], size=1 << 20)
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream)] == [(8192, len(real))]
+
+
+def test_a_bad_ihdr_or_iend_crc_rejects_the_file():
+    """IHDR's CRC is what makes a false start unlikely, and IEND's what makes the
+    end a fact."""
+    png = bytearray(_tiny_png())
+    bad_ihdr = bytes(png[:20]) + bytes([png[20] ^ 1]) + bytes(png[21:])
+    bad_iend = bytes(png[:-1]) + bytes([png[-1] ^ 1])
+    for bad in (bad_ihdr, bad_iend):
+        assert list(mediacarve.carve(_image([(4096, bad)]))) == []
+
+
+def test_a_bad_crc_on_any_critical_chunk_rejects_the_file():
+    """Measured on a Windows volume: checking only IHDR and IEND let in 800 more
+    PNG-shaped hits that neither Pillow nor FFmpeg decodes, each with a failing
+    CRC on a critical chunk between them."""
+    data = bytearray(_load("plain.png"))
+    data[60] ^= 0x01                              # inside IDAT's data
+    assert list(mediacarve.carve(_image([(4096, bytes(data))]))) == []
+
+
+def test_an_ancillary_chunk_with_a_bad_crc_does_not_reject_the_file():
+    """Measured on 38,567 real PNGs: the 16 a CRC check on every chunk lost all
+    failed on fcTL, an animation chunk, and most such files decode. Only critical
+    chunks, whose type starts with an uppercase letter, have their CRC checked."""
+    png = _tiny_png()
+    text = _chunk(b"tEXt", b"Comment\x00hello")
+    broken = text[:-4] + bytes(4)                 # same chunk, CRC zeroed
+    clip = png[:33] + broken + png[33:]
+    stream = _image([(4096, clip)])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream)] == [(4096, len(clip))]
+
+
+def test_ihdr_comes_first_an_idat_is_required_and_cgbi_may_lead():
+    import zlib
+    png = _tiny_png()
+    cgbi = png[:8] + _chunk(b"CgBI", b"\x50\x00\x20\x02") + png[8:]
+    ihdr = png[8:33]
+    idat = _chunk(b"IDAT", zlib.compress(random.Random(3).randbytes(400)))
+    # long enough to clear the floor, so only the order rules can reject them
+    no_ihdr = png[:8] + idat + _chunk(b"IEND")
+    no_idat = png[:8] + ihdr + _chunk(b"tEXt", b"Comment\x00" + b"x" * 200) + _chunk(b"IEND")
+    stream = _image([(4096, cgbi), (8192, no_ihdr), (16384, no_idat)])
+    assert [(h.offset, h.length) for h in mediacarve.carve(stream)] == [(4096, len(cgbi))]
+
+
+def test_a_png_walk_never_passes_its_ceiling():
+    """A chunk that ends past the ceiling used to be stepped over, so a PNG could
+    come back longer than its ceiling."""
+    real = _load("plain.png")
+    stream = _image([(4096, real)])
+    assert list(mediacarve.carve(stream, caps={"png": len(real) - 1})) == []
+    assert [h.length for h in mediacarve.carve(stream, caps={"png": len(real)})] == [len(real)]
+
+
+# ------------------------------------------------------------- false extents
+
+def test_a_capped_hit_hides_nothing():
+    """Measured on an Android system partition: an mdat declaring 4.5 x 10^18
+    bytes was cut at the 4 GiB ceiling and still hid 1,747 files. A capped
+    length is a ceiling, not the file's."""
+    huge = struct.pack(">I", 1) + b"mdat" + struct.pack(">Q", 4557430888798830399)
+    clip = _FTYP + _box(b"free", b"f" * 200) + huge
+    jpg, png = _load("plain.jpg"), _load("plain.png")
+    stream = _image([(4096, clip), (65536, jpg), (131072, png)], size=1 << 20)
+    hits = [(h.offset, h.kind, h.bounded) for h in mediacarve.carve(stream, caps={"mp4": 1 << 19})]
+    assert hits == [(4096, "mp4", "capped"), (65536, "jpeg", "parsed"), (131072, "png", "parsed")]
+
+
+def test_an_avi_must_open_with_its_hdrl_list():
+    """Measured on an Android system partition: RIFF, a size and "AVI " followed
+    by timezone abbreviations was taken as a 774,778,422-byte AVI and hid 455
+    files. A real AVI's first chunk is LIST hdrl."""
+    fake = b"RIFF" + struct.pack("<I", 700_000) + b"AVI LIST\x00LHST\x00WGST\x00EGST\x00MAGST"
+    # a LIST of the wrong type whose size does fit, so only the hdrl rule can say no
+    wrong = b"RIFF" + struct.pack("<I", 700_000) + b"AVI LIST" + struct.pack("<I", 64) + b"LHST"
+    # an hdrl list that claims more than the whole RIFF holds
+    overrun = b"RIFF" + struct.pack("<I", 700_000) + b"AVI LIST" + struct.pack("<I", 900_000) + b"hdrl"
+    png = _load("plain.png")
+    for bad in (fake, wrong, overrun):
+        stream = _image([(4096, bad), (65536, png)], size=1 << 20)
+        assert [(h.offset, h.kind) for h in mediacarve.carve(stream)] == [(65536, "png")]
+
+
+def test_a_webp_must_open_with_a_vp8_chunk():
+    fake = b"RIFF" + struct.pack("<I", 700_000) + b"WEBPJUNK" + b"\x00" * 64
+    png = _load("plain.png")
+    stream = _image([(4096, fake), (65536, png)], size=1 << 20)
+    assert [(h.offset, h.kind) for h in mediacarve.carve(stream)] == [(65536, "png")]
 
 
 
@@ -473,8 +618,11 @@ def test_an_amr_magic_in_text_is_not_a_file(magic):
 _FTYP = struct.pack(">I", 24) + b"ftyp" + b"mp42\x00\x00\x00\x00mp42isom"
 
 
+_HDRL = b"LIST" + struct.pack("<I", 4 + 56) + b"hdrl" + b"\x00" * 56
+
+
 def _avi(body_bytes: int) -> bytes:
-    body = b"AVI " + b"LIST" + b"\x00" * body_bytes
+    body = b"AVI " + _HDRL + b"\x00" * body_bytes
     return b"RIFF" + struct.pack("<I", len(body)) + body
 
 
@@ -531,7 +679,7 @@ def test_no_hit_runs_past_the_end_of_the_stream():
     stream = _image([(4096, clip)], size=size)
     assert [(h.offset, h.length, h.bounded) for h in mediacarve.carve(stream)] \
         == [(4096, size - 4096, "capped")]
-    avi = b"RIFF" + struct.pack("<I", 900_000) + b"AVI LIST"
+    avi = b"RIFF" + struct.pack("<I", 900_000) + b"AVI " + _HDRL
     stream = _image([(8192, avi)], size=size // 2)
     assert [(h.offset, h.length, h.kind, h.bounded) for h in mediacarve.carve(stream)] \
         == [(8192, size // 2 - 8192, "avi", "capped")]

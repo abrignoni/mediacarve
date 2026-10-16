@@ -77,9 +77,11 @@ _ABSOLUTE_CAP = 4 << 30
 
 # A header with nothing behind it is not a file. Measured on real evidence: a
 # stray "\xff\xd8\xff\xd9" in ordinary data parses as a complete four-byte
-# JPEG unless a floor like this rejects it.
+# JPEG unless a floor like this rejects it. PNG checks a CRC on every chunk, so
+# its floor is only the smallest valid file: signature, IHDR, an empty IDAT and
+# IEND, 57 bytes.
 MIN_LENGTHS = {
-    "jpeg": 128, "png": 128, "gif": 64, "webp": 64,
+    "jpeg": 128, "png": 57, "gif": 64, "webp": 64,
     "avi": 1024, "mp4": 1024, "heic": 512,
     "m4a": 1024, "ogg": 128, "ogv": 1024, "amr": 256,
 }
@@ -227,23 +229,61 @@ def _jpeg_length(stream, offset, cap):
 
 
 def _png_length(stream, offset, cap):
-    """Sum PNG chunks to IEND. Each chunk is length, type, data and CRC."""
+    """Walk PNG chunks to IEND, checking the CRC of every critical chunk.
+
+    The W3C PNG specification (third edition) fixes what is checked: each chunk
+    is a length, a type of four ASCII letters, the data and a CRC over the type
+    and data (section 5.3); IHDR is the first chunk (11.2.1); there is at least
+    one IDAT; and IEND's data field is empty (11.2.4). Apple's iOS build tools
+    write a CgBI chunk ahead of IHDR, so that one is allowed first too.
+
+    Critical chunks (an uppercase first letter, section 5.4) have their CRC
+    checked, and ancillary ones do not. Measured both ways. On 38,567 PNGs from
+    public phone images, a check on every chunk lost 16 animated PNGs whose fcTL
+    fails, and 13 of the 20 such files in that image decode. On a Windows volume,
+    checking only IHDR and IEND instead let in 800 more PNG-shaped hits that
+    neither Pillow nor FFmpeg decodes, each with a failing CRC on a critical
+    chunk, and 163 more that one of them renders.
+
+    Without the CRC a declared length was taken at its word. Measured on a
+    Windows volume, two small PNGs whose IEND declared 150,994,944 and 589,824
+    bytes ran on through what followed them and hid 14 PNGs. The CRC is also what
+    lets the length floor sit at the smallest valid PNG: 38 real PNGs of 68 to
+    127 bytes on that volume were under the old 128-byte floor.
+    """
     pos = offset + 8
     end = offset + cap
-    while pos < end:
+    first = True
+    saw_idat = False
+    while True:
         head = _read_at(stream, pos, 8)
         if len(head) < 8:
             return None
         size = struct.unpack(">I", head[:4])[0]
         ctype = head[4:8]
-        if not ctype.isalpha():
+        if not all(0x41 <= b <= 0x5A or 0x61 <= b <= 0x7A for b in ctype):
             return None
-        pos += 12 + size                          # length + type + data + CRC
-        if ctype == b"IEND":
+        if size > 0x7FFFFFFF or pos + 12 + size > end:
+            return None                           # past the ceiling: not a length
+        if first:
+            if ctype == b"CgBI":
+                pass                              # Apple's, ahead of IHDR
+            elif ctype != b"IHDR" or size != 13:
+                return None
+            first = ctype == b"CgBI"
+        body = _read_at(stream, pos + 4, size + 8)
+        if len(body) < size + 8:
+            return None
+        critical = not ctype[0] & 0x20
+        if critical and zlib.crc32(body[:size + 4]) != struct.unpack(">I", body[size + 4:])[0]:
+            return None
+        pos += 12 + size
+        if ctype == b"IDAT":
+            saw_idat = True
+        elif ctype == b"IEND":
+            if size or not saw_idat:
+                return None
             return pos - offset, "parsed"
-        if size > cap:
-            return None
-    return None
 
 
 def _gif_length(stream, offset, cap):
@@ -290,21 +330,35 @@ def _cap(caps, kind):
     return min(caps.get(kind, DEFAULT_CAPS.get(kind, 1 << 20)), _ABSOLUTE_CAP)
 
 
+# The chunk a RIFF form has to open with. An AVI's first chunk is LIST 'hdrl'
+# (Microsoft's AVI RIFF File Reference: "the first required LIST chunk"), and a
+# WebP's is VP8, VP8L or VP8X (RFC 9649, sections 2.5 to 2.7).
+_WEBP_FIRST = frozenset({b"VP8 ", b"VP8L", b"VP8X"})
+
+
 def _riff_length(stream, offset, caps):
-    """RIFF records its own size, so the extent is exact."""
-    head = _read_at(stream, offset, 12)
-    if len(head) < 12:
+    """RIFF records its own size, so the extent is exact once the form checks.
+
+    The size is only as good as the header, so the form's first chunk has to be
+    the one its specification requires, and has to fit inside the size. Measured
+    on an Android system partition: "RIFF", a size and "AVI " followed by
+    timezone abbreviations was taken as a 774,778,422-byte AVI, and hid 455 files
+    that PhotoRec recovered.
+    """
+    head = _read_at(stream, offset, 24)
+    if len(head) < 24:
         return None
     size = struct.unpack("<I", head[4:8])[0]
     form = head[8:12]
-    if form == b"AVI ":
+    first, first_size = head[12:16], struct.unpack("<I", head[16:20])[0]
+    if form == b"AVI " and first == b"LIST" and head[20:24] == b"hdrl":
         kind = "avi"
-    elif form == b"WEBP":
+    elif form == b"WEBP" and first in _WEBP_FIRST:
         kind = "webp"
     else:
         return None
     total = size + 8
-    if total < 16 or total > _cap(caps, kind):
+    if total < 16 or total > _cap(caps, kind) or 20 + first_size > total:
         return None
     return total, "header", kind
 
@@ -337,14 +391,18 @@ def _bmff_ext(major, compatible):
 
 
 def _box_follows(stream, at):
-    """True when a well-formed box header, or the end of the stream, is at ``at``.
+    """True when a box the carver knows, or the end of the stream, is at ``at``.
 
     A vendor box is taken on its shape alone, so after a file has ended, four
     printable bytes in whatever follows can pass for one, with a size read from
     the four bytes before them. Measured on real voice notes laid into random
     bytes: one such "box" declared 4,265,331,032 bytes, and the extent it gave
-    hid 106 files behind it. 0.2.0 reported the same extent. A real box is followed by another box, or by the end
-    of the stream.
+    hid 106 files behind it; 0.2.0 reported the same extent. Requiring only the
+    shape of a box after it was not enough: on a macOS volume, four spaces sized
+    0x20202020 passed, because the text after them ("lass") had that shape too,
+    and the extent hid 179 files. So a vendor box has to be followed by a box in
+    the list above, or by the end of the stream. A vendor box followed by another
+    vendor box ends the file before the first.
     """
     head = _read_at(stream, at, 8)
     if not head:
@@ -353,7 +411,7 @@ def _box_follows(stream, at):
     if len(head) < 8:
         return False
     size = struct.unpack(">I", head[:4])[0]
-    return all(0x20 <= b < 0x7F for b in head[4:8]) and (size >= 8 or size in (0, 1))
+    return head[4:8] in _BMFF_BOXES and (size >= 8 or size in (0, 1))
 
 
 def _bmff_length(stream, offset, caps):
@@ -635,6 +693,11 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
     without it, no hit runs past the end of the stream; one whose header records
     more than the stream holds is cut there and reported as capped.
 
+    A hit inside another hit is suppressed only when the outer hit's length is a
+    fact. A capped length is a ceiling, so a capped hit hides nothing: measured on
+    an Android system partition, an mdat declaring 4.5 x 10^18 bytes was cut at
+    the 4 GiB ceiling and hid 1,747 files that PhotoRec recovered.
+
     The stream is left where the scan finished. Nothing is written to it.
     """
     caps = dict(DEFAULT_CAPS, **(caps or {}))
@@ -680,7 +743,7 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                     continue
             if kinds and hit.kind not in kinds:
                 continue
-            if not nested:
+            if not nested and hit.bounded != "capped":
                 covered_to = max(covered_to, hit.end)
             yield hit
         if progress:

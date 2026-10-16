@@ -83,8 +83,11 @@ length was arrived at:
 JPEG walks its markers rather than searching for the end-of-image marker, which
 matters because an EXIF thumbnail is a whole JPEG inside the APP1 segment: the
 segment's own length steps over it, so the thumbnail neither truncates the file
-nor gets reported as a second one. PNG sums chunks to IEND, GIF walks blocks to
-the trailer, and RIFF and ISO-BMFF read their own recorded sizes.
+nor gets reported as a second one. PNG sums chunks to IEND and checks the CRC of
+every critical chunk, GIF walks blocks to the trailer, and RIFF and ISO-BMFF read
+their own recorded sizes once the file opens with the chunk or box its format
+requires: `LIST hdrl` for AVI, a VP8 chunk for WebP, and a box mediacarve knows
+after any vendor box.
 
 Ogg walks its pages and checks each one's CRC, the page sequence of each stream,
 and the end-of-stream flag. Not every writer sets that flag, so a file ends at the
@@ -110,7 +113,8 @@ at one is reported as `capped`:
   file's to claim. Without it a file that starts inside the range ends where its
   own structure says, and hits from two ranges can overlap.
 
-Files found inside another file are suppressed by default and reported with
+A hit cut at a limit hides nothing, because its length is not known. Files found
+inside another file are suppressed by default and reported with
 `nested=True`. On an MJPG AVI that is the difference between one video and the
 twelve JPEG frames inside it.
 
@@ -214,18 +218,54 @@ end-of-stream page missed 9 of the 27 distinct Ogg Opus files from `hickman_a13`
 which end cleanly without one. And in random bytes, one MP4 ran 3.97 MB past its
 end: the four printable bytes `sIs}` after it passed for a vendor box declaring
 4,265,331,032 bytes, and the extent hid 106 of the files above. 0.2.0 reports the
-same extent. A
-vendor box now has to be followed by another box, or by the end of the stream.
+same extent. A vendor box now has to be followed by a box mediacarve knows, or by
+the end of the stream.
 
-**Against 0.2.0.** On five constructed volumes in the corpus (`takeout-exfat`,
-`takeout-fat32`, `windows-ntfs`, `macos-apfs` and `android-root-ext4` from the
-raw image fixtures), every extent 0.2.0 reported came back the same but one. On
-`macos-apfs`, 0.2.0 reported an MP4 at 1.86 GB, cut at the end of the image,
-because a 2.6 GB vendor "box" `dlm(` followed it. It is now 213,936 bytes, the sum
-of its `ftyp`, `moov`, `free` and `mdat`, and the 5,121 files the long extent hid
-are reported. One MP4 hit there is now `.mov`. New on the others: 58 Ogg Vorbis and one Ogg Theora video, all of
-which decode in FFmpeg without an error. 21 stills are now `.avif` and decode as
-AV1, and one `mp4` is now `m4a`.
+**Against PhotoRec.** PhotoRec 7.2 was run as a second carver on five constructed
+volumes in the corpus (`takeout-exfat`, `takeout-fat32`, `windows-ntfs`,
+`macos-apfs` and `android-root-ext4` from the raw image fixtures), and hits were
+matched by offset. On the two Takeout volumes the file table gives every file's
+size: in all 42 files where the two carvers' lengths differ, mediacarve's is the
+file's size.
+
+The comparison found five ways a false extent hid real files, each pinned as a
+test. Every number is a file that PhotoRec recovered and that decodes:
+
+- an `mdat` declaring 4.5 x 10^18 bytes, cut at the 4 GiB ceiling, hid 1,733 on
+  `android-root-ext4`. A capped hit now hides nothing.
+- `RIFF`, a size and `AVI ` followed by timezone abbreviations, read as a 774 MB
+  AVI, hid 455 there. An AVI now has to open with `LIST hdrl`, and a WebP with a
+  VP8 chunk.
+- four spaces read as a vendor box after a real `uuid` box hid 179 on
+  `macos-apfs`, because the text after them had the shape of a box header.
+- PNGs whose IEND declared 150,994,944 and 589,824 bytes hid 14 on
+  `windows-ntfs`. IEND now has to be empty, and critical chunks pass their CRC.
+- 38 PNGs of 68 to 127 bytes were under the 128-byte floor. With the CRCs checked
+  the floor is the smallest valid PNG, 57 bytes.
+
+Afterwards PhotoRec recovered 4 media files that mediacarve does not report,
+none of which decodes cleanly: a 19,571-byte piece of a 3.5 MB JPEG whose APP1
+length is one byte off, which mediacarve rejects, and three MP4 or Ogg files
+FFmpeg reports errors in. It also recovered 32 MP3, 23 ICO, 7 SVG and 1 MPEG-TS,
+formats mediacarve does not carve. mediacarve reports thousands of files PhotoRec
+does not, nearly all inside other files: PhotoRec looks for a header only where
+a block starts.
+
+**Against 0.2.0.** On the same five volumes: the two Takeout volumes are
+unchanged. On `android-root-ext4`, 0.2.0's 2,556 hits become 10,443: the false
+AVI is gone, 7,888 hits are new and 7,882 of them decode, 21 stills are now
+`.avif` and one `mp4` is now `m4a`. On `macos-apfs`, 9,777 become 15,219. 0.2.0
+reported an MP4 at 1.86 GB, cut at the end of the image, because a 2.6 GB vendor
+"box" `dlm(` followed it; it is now 213,936 bytes, the sum of its `ftyp`, `moov`,
+`free` and `mdat`. 5,442 hits are new, and 5,356 of the 5,375 stills among them
+decode; the 67 MP4s are like the 82 0.2.0 found there, most of which FFmpeg
+reports errors in. On `windows-ntfs`, 2,857 become 3,039: 181 PNGs with a failing
+critical CRC are gone, 156 of which neither Pillow nor FFmpeg decodes; 334 PNGs
+are new, 328 of which one of them does; and 29 Ogg Vorbis files are new.
+
+**PNG on known data.** Up to 1,500 PNGs were sampled from each of 29 public phone
+images. Of the 38,585 that 0.2.0 returns at exactly their file size, this walk
+returns 38,583 the same way. The other two fail their IDAT CRC and do not decode.
 
 **Controls.** For the audio kinds, each of these was broken in turn and made its
 own test fail: the Ogg CRC check, the page sequence check, the rule that first
@@ -233,8 +273,13 @@ pages come before any other, taking a first page cut off by the end of the strea
 on trust, ignoring that cut, the AMR padding bits, the AMR frame types a storage
 file may carry, the all-zero frame rule, the AMR length floor, the brand to
 extension mapping, reading the compatible brands, and the rule that a vendor box
-is followed by a box. Ending the walk at the end-of-stream page is not one of
-them: whatever follows that page ends the walk at the same byte anyway.
+is followed by a box mediacarve knows. Ending the walk at the end-of-stream page
+is not one of them: whatever follows that page ends the walk at the same byte
+anyway. The same was done for the false-extent fixes: capped hits hiding others,
+the AVI `hdrl` rule, the WebP first chunk, the AVI first chunk fitting its RIFF,
+the PNG CRC check, checking only IHDR and IEND instead of every critical chunk,
+checking every chunk instead, the empty IEND, the IDAT requirement, IHDR first,
+CgBI ahead of IHDR, the PNG ceiling, and the old 128-byte floor.
 
 ## Tests
 
