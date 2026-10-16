@@ -11,7 +11,7 @@ themselves need nothing but pytest.
     python tools/make_fixtures.py tests/fixtures/media
     python tools/make_fixtures.py tests/fixtures/media --only av
 
-``--only`` writes one group (stills, opencv, av, pcm or mp3) and keeps the manifest entries
+``--only`` writes one group (stills, opencv, av, pcm, mp3 or db) and keeps the manifest entries
 of the others, so adding a group does not re-encode the files already committed.
 The av group needs ffmpeg, the opencore-amr and vo-amrwbenc libraries for AMR
 (Homebrew has both), and sips from macOS for HEIC. The pcm group needs ffmpeg and
@@ -66,7 +66,27 @@ def write_media(out_dir, only=None):
         _write_pcm(out_dir, record)
     if only in (None, "mp3"):
         _write_mp3(out_dir, record)
+    if only in (None, "db"):
+        _write_db(out_dir, record)
     return made
+
+
+def _write_db(out_dir, record):
+    """A SQLite database written by the SQLite library Python ships."""
+    import sqlite3
+    path = os.path.join(out_dir, "small.sqlite")
+    if os.path.exists(path):
+        os.remove(path)
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA page_size = 4096")
+    con.execute("PRAGMA journal_mode = DELETE")
+    con.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, picture BLOB)")
+    rnd = random.Random(21)
+    for i in range(40):
+        con.execute("INSERT INTO notes (body) VALUES (?)", ("note %d %s" % (i, rnd.random()),))
+    con.commit()
+    con.close()
+    record("small.sqlite", "sqlite")
 
 
 def _write_mp3(out_dir, record):
@@ -300,7 +320,7 @@ def _write_videos(out_dir, record):
 
 def main(argv):
     only = None
-    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3"):
+    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db"):
         only = argv[3]
     elif len(argv) != 2:
         print(__doc__)

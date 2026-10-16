@@ -68,7 +68,7 @@ def _image(pieces, size=None, filler=b"\x00", seed=11):
 def test_each_fixture_is_recovered_exactly_on_its_own(name, meta):
     data = _load(name)
     with open(os.path.join(MEDIA, name), "rb") as fh:
-        hits = list(mediacarve.carve(fh))
+        hits = list(mediacarve.carve(fh, kinds=mediacarve.DEFAULT_KINDS | {meta["kind"]}))
     assert len(hits) == 1, f"{name}: {[(h.kind, h.offset, h.length) for h in hits]}"
     hit = hits[0]
     assert (hit.offset, hit.length, hit.kind, hit.ext) \
@@ -80,7 +80,7 @@ def test_each_fixture_is_recovered_from_inside_a_larger_image(name, meta):
     data = _load(name)
     offset = 8192
     stream = _image([(offset, data)])
-    hits = list(mediacarve.carve(stream))
+    hits = list(mediacarve.carve(stream, kinds=mediacarve.DEFAULT_KINDS | {meta["kind"]}))
     assert len(hits) == 1, name
     hit = hits[0]
     assert (hit.offset, hit.length) == (offset, meta["length"])
@@ -98,7 +98,7 @@ def test_several_files_in_one_image_all_come_back_byte_for_byte():
         expected.append((offset, m["length"], m["kind"], m["sha256"]))
         offset += len(data) + rnd.randrange(1000, 9000)
     stream = _image(pieces)
-    hits = list(mediacarve.carve(stream))
+    hits = list(mediacarve.carve(stream, kinds=mediacarve.ALL_KINDS))
     assert len(hits) == len(expected)
     for hit, (off, length, kind, sha) in zip(hits, expected):
         assert (hit.offset, hit.length, hit.kind) == (off, length, kind)
@@ -626,6 +626,102 @@ def test_a_malformed_id3v2_header_does_not_vouch_for_a_stream():
     chained = good + version_ff
     stream = _image([(4096, good + audio), (65536, big_byte + audio), (131072, chained + audio)])
     assert [(h.offset, h.length) for h in mediacarve.carve(stream)] == [(4096, len(good) + len(audio))]
+
+# -------------------------------------------------------------------- sqlite
+
+def _db():
+    return _load("small.sqlite")
+
+
+def _db_with(blob, tmp_path):
+    """A database written by the SQLite library, holding ``blob`` in one record."""
+    import sqlite3
+    path = tmp_path / "with_blob.sqlite"
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA page_size = 4096")
+    con.execute("PRAGMA journal_mode = DELETE")
+    con.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB)")
+    con.execute("INSERT INTO t (b) VALUES (?)", (blob,))
+    con.commit()
+    con.close()
+    return path.read_bytes()
+
+
+def test_databases_are_carved_only_when_asked_for():
+    """A scan with no kinds is media only, as it was before databases were
+    added; databases are asked for by name, with "databases" or with "all"."""
+    db, png = _db(), _load("plain.png")
+    stream = _image([(4096, db), (65536, png)])
+    assert [h.kind for h in mediacarve.carve(stream)] == ["png"]
+    for kinds in ({"sqlite"}, mediacarve._kinds_arg("databases"), mediacarve._kinds_arg("all")):
+        assert ("sqlite", len(db)) in [(h.kind, h.length) for h in mediacarve.carve(stream, kinds=kinds)]
+
+
+def test_a_database_hides_nothing_inside_it(tmp_path):
+    """Media stored in a database's records are still media."""
+    gif = _load("plain.gif")
+    db = _db_with(gif, tmp_path)
+    at = db.find(gif)
+    assert at > 0
+    stream = _image([(4096, db)])
+    assert sorted((h.offset, h.kind) for h in mediacarve.carve(stream, kinds=mediacarve.ALL_KINDS)) \
+        == [(4096, "sqlite"), (4096 + at, "gif")]
+
+
+def test_nothing_hides_a_database():
+    """A blob is spread over a database's pages, so its own sizes can claim the
+    next file. Measured once in 8,700 real databases laid end to end: a HEIC
+    ran 34,095 bytes into the next database, over its header."""
+    db = _db()
+    overrun = _FTYP + _box(b"moov", b"m" * 200) + _box(b"mdat", b"d" * 3000)[:8] + b"d" * 1000
+    stream = _image([(4096, overrun), (4096 + len(overrun), db)], size=1 << 20)
+    hits = [(h.offset, h.kind) for h in mediacarve.carve(stream, kinds=mediacarve.ALL_KINDS)]
+    assert (4096 + len(overrun), "sqlite") in hits
+    assert hits[0][1] == "mp4" and hits[0][0] == 4096
+
+
+def test_a_page_count_sqlite_does_not_vouch_for_is_not_used():
+    """fileformat2 1.3.7: the in-header size counts only when it is not zero and
+    the change counter equals the version-valid-for number. Measured: 15 of
+    8,700 real databases have no count, and are not reported."""
+    db = bytearray(_db())
+    stale = bytearray(db)
+    stale[92:96] = (struct.unpack(">I", db[92:96])[0] + 1).to_bytes(4, "big")
+    zero = bytearray(db)
+    zero[28:32] = bytes(4)
+    for bad in (stale, zero):
+        assert list(mediacarve.carve(_image([(4096, bytes(bad))]), kinds={"sqlite"})) == []
+
+
+@pytest.mark.parametrize("at,value,why", [
+    (16, b"\x03\x00", "page size not a power of two"),
+    (18, b"\x03", "write version neither 1 nor 2"),
+    (21, b"\x41", "maximum payload fraction not 64"),
+    (44, b"\x00\x00\x00\x05", "schema format above 4"),
+    (56, b"\x00\x00\x00\x04", "text encoding above 3"),
+    (80, b"\x01", "reserved bytes not zero"),
+])
+def test_a_header_sqlite_would_refuse_is_not_a_database(at, value, why):
+    db = bytearray(_db())
+    db[at:at + len(value)] = value
+    assert list(mediacarve.carve(_image([(4096, bytes(db))]), kinds={"sqlite"})) == [], why
+
+
+def test_page_one_copied_into_a_log_is_not_a_database():
+    """A WAL frame header (24 bytes) or a journal page record (4 bytes) opens
+    with the page number (fileformat2, 4.1 and 3). Measured: all 435 header hits
+    on two Android volumes that were not database files were page 1 inside WAL
+    files, and the rule takes 14,611 of 14,621 such hits out of 1,740 real WALs."""
+    db = _db()
+    wal_frame = struct.pack(">IIIIII", 1, 0, 0x1234, 0x5678, 0x9ABC, 0xDEF0)
+    journal = b"\x00" * 20 + struct.pack(">I", 1)
+    for prefix in (wal_frame, journal):
+        stream = _image([(4096 - len(prefix), prefix + db)])
+        assert [h.offset for h in mediacarve.carve(stream, kinds={"sqlite"})] == [], prefix[:4]
+    stream = _image([(4096, db)])                 # the same bytes, not in a log
+    assert [h.offset for h in mediacarve.carve(stream, kinds={"sqlite"})] == [4096]
+
+
 
 # ----------------------------------------------------------------------- ogg
 

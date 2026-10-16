@@ -153,6 +153,13 @@
       "ext": ".mp3",
       "length": 4412,
       "sha256": "5b71b32e04d908e99484580b3f5b3c3dce153255d0daf8a5673cce0db1cfeacd"
+    },
+    {
+      "name": "small.sqlite",
+      "kind": "sqlite",
+      "ext": ".sqlite",
+      "length": 8192,
+      "sha256": "103c4db5472ec089d61823c8167e7f27d7710f9b53e2aa2f8acb2b14dcb5f942"
     }
   ]
 }
