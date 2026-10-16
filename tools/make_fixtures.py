@@ -12,7 +12,7 @@ themselves need nothing but pytest.
     python tools/make_fixtures.py tests/fixtures/media --only av
 
 ``--only`` writes one group (stills, opencv, av, pcm, mp3, db, sqlcipher, plist, zip,
-pdf, tiff or bmpico) and keeps the manifest entries
+pdf, tiff, bmpico or mkv) and keeps the manifest entries
 of the others, so adding a group does not re-encode the files already committed.
 The av group needs ffmpeg, the opencore-amr and vo-amrwbenc libraries for AMR
 (Homebrew has both), and sips from macOS for HEIC. The pcm group needs ffmpeg and
@@ -73,6 +73,8 @@ def write_media(out_dir, only=None):
         _write_mp3(out_dir, record)
     if only in (None, "db"):
         _write_db(out_dir, record)
+    if only in (None, "mkv"):
+        _write_mkv(out_dir, record)
     if only in (None, "bmpico"):
         _write_bmp_ico(out_dir, record)
     if only in (None, "tiff"):
@@ -196,6 +198,25 @@ def _write_db(out_dir, record):
     con.commit()
     con.close()
     record("small.sqlite", "sqlite")
+
+
+def _write_mkv(out_dir, record):
+    """Matroska and WebM from FFmpeg's muxer: an .mkv (FFV1 and FLAC), a .webm
+    (VP9 and Opus), and a WebM written with -live 1, which leaves the Segment's
+    size unknown as a streaming writer does."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print("  ffmpeg absent: no Matroska fixtures written", file=sys.stderr)
+        return
+    ff = (ffmpeg, "-hide_banner", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10",
+          "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "2", "-fflags", "+bitexact")
+    _run(*ff, "-c:v", "ffv1", "-c:a", "flac", os.path.join(out_dir, "plain.mkv"))
+    record("plain.mkv", "mkv")
+    _run(*ff, "-c:v", "libvpx-vp9", "-c:a", "libopus", os.path.join(out_dir, "plain.webm"))
+    record("plain.webm", "mkv")
+    _run(*ff, "-c:v", "libvpx-vp9", "-c:a", "libopus", "-live", "1", "-f", "webm",
+         os.path.join(out_dir, "live.webm"))
+    record("live.webm", "mkv")
 
 
 def _write_bmp_ico(out_dir, record):
@@ -518,7 +539,7 @@ def _write_videos(out_dir, record):
 
 def main(argv):
     only = None
-    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "sqlcipher", "plist", "zip", "pdf", "tiff", "bmpico"):
+    if len(argv) == 4 and argv[2] == "--only" and argv[3] in ("stills", "opencv", "av", "pcm", "mp3", "db", "sqlcipher", "plist", "zip", "pdf", "tiff", "bmpico", "mkv"):
         only = argv[3]
     elif len(argv) != 2:
         print(__doc__)

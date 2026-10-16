@@ -50,7 +50,7 @@ import zipfile
 import zlib
 from typing import NamedTuple
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 # How much to read at a time while scanning, and how much to carry over so a
 # signature straddling two blocks is still found.
@@ -75,6 +75,7 @@ DEFAULT_CAPS = {
     "m4a": 4 << 30,
     "ogg": 1 << 30,
     "ogv": 4 << 30,
+    "mkv": 4 << 30,
     "amr": 64 << 20,
     "wav": 4 << 30,
     "aiff": 4 << 30,
@@ -96,7 +97,7 @@ _ABSOLUTE_CAP = 4 << 30
 MIN_LENGTHS = {
     "jpeg": 128, "png": 57, "gif": 64, "webp": 64,
     "avi": 1024, "mp4": 1024, "heic": 512, "tiff": 64, "bmp": 64, "ico": 64,
-    "m4a": 1024, "ogg": 128, "ogv": 1024, "amr": 256,
+    "m4a": 1024, "ogg": 128, "ogv": 1024, "mkv": 512, "amr": 256,
     "wav": 64, "aiff": 64, "caf": 64, "mp3": 128, "sqlite": 512,
     "sqlite-encrypted": 512, "bplist": 41,
     "zip": 22, "pdf": 64,
@@ -107,14 +108,14 @@ MIN_LENGTHS = {
 EXTENSIONS = {
     "jpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp",
     "avi": ".avi", "mp4": ".mp4", "heic": ".heic", "tiff": ".tif", "bmp": ".bmp", "ico": ".ico",
-    "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "amr": ".amr",
+    "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "mkv": ".mkv", "amr": ".amr",
     "wav": ".wav", "aiff": ".aiff", "caf": ".caf", "mp3": ".mp3",
     "sqlite": ".sqlite", "sqlite-encrypted": ".sqlite", "bplist": ".plist", "zip": ".zip",
     "pdf": ".pdf",
 }
 
 IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic", "tiff", "bmp", "ico"})
-VIDEO_KINDS = frozenset({"avi", "mp4", "ogv"})
+VIDEO_KINDS = frozenset({"avi", "mp4", "ogv", "mkv"})
 AUDIO_KINDS = frozenset({"m4a", "ogg", "amr", "wav", "aiff", "caf", "mp3"})
 MEDIA_KINDS = IMAGE_KINDS | VIDEO_KINDS | AUDIO_KINDS
 DATABASE_KINDS = frozenset({"sqlite", "sqlite-encrypted"})
@@ -168,6 +169,7 @@ _SCAN = re.compile(
     b"|%PDF-[12]\\.[0-9][\r\n]"     # PDF header line, version 1.x or 2.x
     b"|ID3[\x02-\x04]\x00"         # ID3v2 tag, versions 2.2 to 2.4
     b"|II\\*\x00|MM\x00\\*"         # TIFF header, little- or big-endian ("*" is 42)
+    b"|\x1a\x45\xdf\xa3"           # EBML header: Matroska and WebM
     b"|BM.{4}\x00{4}.{4}[\x0c\x28\x6c\x7c]\x00{3}"  # BMP: zero reserved words, a DIB header size
     b"|\xff[\xe2\xe3\xf2\xf3\xfa\xfb]",  # MPEG audio Layer III frame sync
     re.DOTALL)
@@ -551,6 +553,166 @@ def _tiff_length(stream, offset, cap, loose=None):
     if not confirmed and loose is not None:
         loose.add(offset)
     return end, "parsed"
+
+
+# Matroska element IDs (RFC 9559, section 5.1), with the EBML Global Elements
+# CRC-32 and Void, which may appear in any Master Element (RFC 8794, 11.3).
+_EBML_GLOBAL = frozenset({0xBF, 0xEC})
+_MKV_SEGMENT = 0x18538067
+_MKV_CLUSTER = 0x1F43B675
+_MKV_SEGMENT_CHILDREN = frozenset({
+    0x114D9B74, 0x1549A966, 0x1654AE6B, _MKV_CLUSTER, 0x1C53BB6B,   # SeekHead, Info, Tracks, Cluster, Cues
+    0x1941A469, 0x1043A770, 0x1254C367}) | _EBML_GLOBAL               # Attachments, Chapters, Tags
+_MKV_CLUSTER_CHILDREN = frozenset({
+    0xE7, 0xA7, 0xAB, 0xA3, 0xA0,     # Timestamp, Position, PrevSize, SimpleBlock, BlockGroup
+    0x5854, 0xAF}) | _EBML_GLOBAL      # SilentTracks, EncryptedBlock (RFC 9559, appendix A)
+_MKV_DOCTYPES = {b"matroska": ".mkv", b"webm": ".webm"}
+
+
+def _ebml_vint(data, pos, width):
+    """An EBML variable-size integer at ``pos`` (RFC 8794, section 4): its width
+    is one more than the leading zero bits of its first byte. Returns the value
+    with the marker kept (an Element ID) or cleared (a data size), its width, and
+    whether every data bit is one, the unknown size (6.2); or None."""
+    if pos >= len(data):
+        return None
+    first = data[pos]
+    size = 1
+    while size <= width and not first & (0x80 >> (size - 1)):
+        size += 1
+    if size > width or pos + size > len(data):
+        return None
+    raw = int.from_bytes(data[pos:pos + size], "big")
+    value = raw & ((1 << (7 * size)) - 1)
+    return raw, value, size, value == (1 << (7 * size)) - 1
+
+
+def _ebml_element(stream, at):
+    """The Element ID, data size, header width and unknown flag at ``at``."""
+    head = _read_at(stream, at, 12)
+    ident = _ebml_vint(head, 0, 4)
+    if ident is None:
+        return None
+    size = _ebml_vint(head, ident[2], 8)
+    if size is None:
+        return None
+    return ident[0], size[1], ident[2] + size[2], size[3]
+
+
+def _mkv_child(stream, offset, pos, element, first, children, outer):
+    """Whether ``element`` at ``pos`` continues an Unknown-Sized Element whose
+    children are ``children``. CRC-32 "MUST be the first ordered EBML Element
+    within its Parent Element" and is 4 bytes (RFC 8794, 11.3.1), so it counts
+    only there. Void may be anywhere, and its ID is one byte, so in a walk
+    reaching past the file's end any random byte 0xEC passes for one: a Void
+    counts only when what follows it is a child here or of ``outer``, the level
+    above, which a Void at the very end of a file is not."""
+    if element is None or element[0] not in children:
+        return False
+    if element[0] == 0xBF:
+        return pos == first and element[1] == 4 and not element[3]
+    if element[0] == 0xEC:
+        if element[3]:
+            return False
+        after = _ebml_element(stream, offset + pos + element[2] + element[1])
+        return after is not None and (after[0] in children or after[0] in outer) \
+            and after[0] not in _EBML_GLOBAL
+    return True
+
+
+def _ebml_length(stream, offset, cap):
+    """A Matroska or WebM file is an EBML Header and one Segment.
+
+    The EBML Header (ID 0x1A45DFA3) has a known size and names the DocType,
+    "matroska" (RFC 9559) or "webm"; the Segment (0x18538067) follows. When the
+    Segment's size is known, the file ends where it does, if every element in it
+    is whole. A writer that streams leaves the size unknown, "all VINT_DATA bits
+    set to one", and so may a Cluster (RFC 9559, unknownsizeallowed). An
+    Unknown-Sized Element ends at the first element that is not one of its
+    descendants (RFC 8794, 6.2), so the walk reads the Segment's children, and
+    each Cluster's, until an element that is neither: the end of the file, a new
+    EBML Header, or bytes that are not Matroska.
+
+    A Segment's size says what the writer meant to write, not what is there. On
+    one macOS volume holding Discord, Signal and Telegram data, 182 of 200 WebM
+    headers sampled declare a Segment whose Clusters break off partway, and those
+    182 are exactly the ones FFmpeg reports errors in: pieces of videos, it
+    seems, kept under the header of the whole one. So
+    the walk goes into every Cluster, and where one breaks off the file ends
+    before the block the cut fell in, as an Ogg stream with no last page ends at
+    its last good one.
+
+    Measured on 7 distinct WebM files from public phone images: all have a
+    known Segment size, every element is whole, and they end exactly at the
+    file's end.
+    """
+    header = _ebml_element(stream, offset)
+    if header is None or header[3] or header[1] > 4096:
+        return None
+    body = _read_at(stream, offset + header[2], header[1])
+    if len(body) < header[1]:
+        return None
+    doctype = None
+    pos = 0
+    while pos < len(body):
+        ident = _ebml_vint(body, pos, 4)
+        size = ident and _ebml_vint(body, pos + ident[2], 8)
+        if not size or size[3]:
+            return None
+        start = pos + ident[2] + size[2]
+        if ident[0] == 0x4282:                    # DocType
+            doctype = body[start:start + size[1]].rstrip(b"\x00")
+        pos = start + size[1]
+    ext = _MKV_DOCTYPES.get(doctype)
+    if ext is None or pos != len(body):
+        return None
+    at = header[2] + header[1]
+    segment = _ebml_element(stream, offset + at)
+    if segment is None or segment[0] != _MKV_SEGMENT:
+        return None
+    pos = at + segment[2]
+    limit = cap if segment[3] else pos + segment[1]
+    if limit > cap:
+        return None
+    first_child = pos
+    clusters = 0
+    while pos < limit:
+        element = _ebml_element(stream, offset + pos)
+        if not _mkv_child(stream, offset, pos, element, first_child, _MKV_SEGMENT_CHILDREN, ()):
+            break
+        ident, size, width, unknown = element
+        if unknown and ident != _MKV_CLUSTER:
+            break                                 # only a Cluster may be unknown-sized here
+        if ident != _MKV_CLUSTER:
+            if pos + width + size > limit:
+                break
+            pos += width + size
+            continue
+        stop = limit if unknown else pos + width + size
+        if stop > limit:
+            break
+        inner = last = pos + width
+        while inner < stop:
+            child = _ebml_element(stream, offset + inner)
+            if not _mkv_child(stream, offset, inner, child, pos + width, _MKV_CLUSTER_CHILDREN,
+                              _MKV_SEGMENT_CHILDREN) or child[3] or inner + child[2] + child[1] > stop:
+                break
+            last = inner
+            inner += child[2] + child[1]
+        if not unknown and inner != stop:
+            # The Cluster breaks off. Where the bytes were cut, the block that was
+            # cut still claims its full size, so the walk reads on through
+            # whatever follows and fails one element later: that block is not
+            # whole either, and the file ends where it starts.
+            if last > pos + width:
+                clusters += 1
+                pos = last
+            break
+        clusters += 1
+        pos = inner
+    if not clusters:
+        return None
+    return pos, "parsed", "mkv", ext
 
 
 # The DIB headers Microsoft documents: BITMAPCOREHEADER (12 bytes),
@@ -1636,6 +1798,8 @@ def _measure(stream, offset, kind, caps, dead=None, loose=None):
         got = _tiff_length(stream, offset, _cap(caps, kind), loose)
     elif kind == "bmp":
         got = _bmp_length(stream, offset, _cap(caps, kind))
+    elif kind == "mkv":
+        got = _ebml_length(stream, offset, _cap(caps, kind))
     elif kind == "ico":
         got = _ico_length(stream, offset, _cap(caps, kind))
     elif kind == "riff":
@@ -1682,7 +1846,7 @@ def _measure(stream, offset, kind, caps, dead=None, loose=None):
 # the stream's end. Measured on one 33.8 MB APK carved for ZIPs only: 89,932
 # MP3 walks and 25 seconds, against a third of a second without them.
 _SIGNATURE_KINDS = {
-    "jpeg": {"jpeg"}, "png": {"png"}, "gif": {"gif"}, "tiff": {"tiff"}, "bmp": {"bmp"}, "ico": {"ico"}, "riff": {"avi", "webp", "wav"},
+    "jpeg": {"jpeg"}, "png": {"png"}, "gif": {"gif"}, "tiff": {"tiff"}, "bmp": {"bmp"}, "ico": {"ico"}, "mkv": {"mkv"}, "riff": {"avi", "webp", "wav"},
     "bmff": {"mp4", "heic", "m4a"}, "ogg": {"ogg", "ogv"}, "amr": {"amr"},
     "iff": {"aiff"}, "caf": {"caf"}, "mp3": {"mp3"},
     "sqlite": {"sqlite", "sqlite-encrypted"},
@@ -1795,6 +1959,8 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                 kind = "jpeg"
             elif sig in (b"II\x2a\x00", b"MM\x00\x2a"):
                 kind = "tiff"
+            elif sig == b"\x1a\x45\xdf\xa3":
+                kind = "mkv"
             elif sig.startswith(b"BM"):
                 kind = "bmp"
             elif sig.startswith(b"\x00\x00"):
