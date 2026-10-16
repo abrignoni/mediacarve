@@ -856,6 +856,105 @@ def test_an_lzw_strip_that_does_not_open_with_a_clear_code_hides_nothing():
     assert [h.kind for h in mediacarve.carve(stream)] == ["tiff", "png"]
 
 
+# ------------------------------------------------------------------ bmp, ico
+
+@pytest.mark.parametrize("at,value,why", [
+    (6, b"\x01\x00", "a reserved word that is not zero"),
+    (14, b"\x0d", "a DIB header size Microsoft does not document"),
+    (26, b"\x02\x00", "planes not 1"),
+    (28, b"\x07\x00", "a bit depth not listed"),
+    (10, b"\x0a\x00\x00\x00", "pixels before the headers end"),
+    (22, b"\x00\x00\x00\x00", "no height"),
+])
+def test_a_header_a_bmp_cannot_have_is_not_a_file(at, value, why):
+    data = bytearray(_load("plain.bmp"))
+    data[at:at + len(value)] = value
+    assert list(mediacarve.carve(_image([(4096, bytes(data))]), kinds={"bmp"})) == [], why
+
+
+def test_the_bmp_walk_checks_what_the_signature_also_checks():
+    """The scan's BMP pattern already asks for zero reserved words and a
+    documented DIB header size, so a carve cannot show the walk's own checks;
+    the walk is asked directly."""
+    for at, value in ((6, b"\x01\x00"), (14, b"\x0d")):
+        data = bytearray(_load("plain.bmp"))
+        data[at:at + len(value)] = value
+        assert mediacarve._bmp_length(io.BytesIO(bytes(data)), 0, 1 << 30) is None, at
+
+
+def test_the_icon_walk_checks_what_the_signature_also_checks():
+    for at, value in ((0, b"\x01"), (2, b"\x03")):
+        data = bytearray(_load("dib.ico"))
+        data[at:at + len(value)] = value
+        assert mediacarve._ico_length(io.BytesIO(bytes(data)), 0, 1 << 30) is None, at
+
+
+def test_a_bmp_whose_rows_do_not_fit_its_size_is_not_a_file():
+    """Uncompressed rows take the minimum stride, the width in bytes rounded up
+    to a DWORD (BITMAPINFOHEADER), so bfSize has to hold them all."""
+    data = bytearray(_load("plain.bmp"))
+    data[2:6] = struct.pack("<I", len(data) - 4)
+    assert list(mediacarve.carve(_image([(4096, bytes(data))]), kinds={"bmp"})) == []
+    data[2:6] = struct.pack("<I", len(data))
+    assert [h.length for h in mediacarve.carve(_image([(4096, bytes(data))]), kinds={"bmp"})] == [len(data)]
+
+
+def test_an_icon_hides_the_pngs_it_holds():
+    data = _load("png.ico")
+    stream = _image([(4096, data)])
+    assert [h.kind for h in mediacarve.carve(stream, kinds=mediacarve.IMAGE_KINDS)] == ["ico"]
+    assert sorted(h.kind for h in mediacarve.carve(stream, kinds=mediacarve.IMAGE_KINDS, nested=True)) \
+        == ["ico", "png", "png", "png"]
+
+
+def test_icons_are_asked_for():
+    """An icon scan costs more than it returns in a default run (_ICO_SCAN), so a
+    scan with no kinds finds the PNGs inside an icon and not the icon."""
+    stream = _image([(4096, _load("png.ico"))])
+    assert [h.kind for h in mediacarve.carve(stream)] == ["png", "png", "png"]
+    for kinds in ({"ico"}, mediacarve._kinds_arg("images"), mediacarve.ALL_KINDS):
+        assert "ico" in [h.kind for h in mediacarve.carve(stream, kinds=kinds)]
+
+
+@pytest.mark.parametrize("at,value,why", [
+    (0, b"\x01", "a reserved word that is not zero"),
+    (2, b"\x03", "a type neither icon nor cursor"),
+    (9, b"\x01", "an entry's reserved byte that is not zero"),
+])
+def test_a_directory_an_icon_cannot_have_is_not_a_file(at, value, why):
+    data = bytearray(_load("dib.ico"))
+    data[at:at + len(value)] = value
+    assert list(mediacarve.carve(_image([(4096, bytes(data))]), kinds={"ico"})) == [], why
+
+
+def test_an_icon_whose_image_is_neither_a_dib_nor_a_png_is_not_a_file():
+    data = bytearray(_load("dib.ico"))
+    at = struct.unpack("<I", data[6 + 16 + 12:6 + 16 + 16])[0]
+    assert data[at:at + 4] == b"\x28\x00\x00\x00"
+    data[at] = 0x29
+    assert list(mediacarve.carve(_image([(4096, bytes(data))]), kinds={"ico"})) == []
+
+
+def test_an_icon_whose_first_image_does_not_follow_its_directory_is_not_a_file():
+    """Every icon measured has its first image right after the directory, and a
+    directory start alone is common in other data, so a gap is refused."""
+    data = _load("dib.ico")
+    count = struct.unpack("<H", data[4:6])[0]
+    table = bytearray(data[6:6 + 16 * count])
+    for i in range(count):
+        at = struct.unpack("<I", table[16 * i + 12:16 * i + 16])[0]
+        table[16 * i + 12:16 * i + 16] = struct.pack("<I", at + 16)
+    gapped = data[:6] + bytes(table) + bytes(16) + data[6 + 16 * count:]
+    assert list(mediacarve.carve(_image([(4096, gapped)]), kinds={"ico"})) == []
+
+
+def test_a_cursor_is_named_cur():
+    data = bytearray(_load("dib.ico"))
+    data[2] = 2
+    hits = list(mediacarve.carve(_image([(4096, bytes(data))]), kinds={"ico"}))
+    assert [(h.kind, h.ext, h.length) for h in hits] == [("ico", ".cur", len(data))]
+
+
 # ---------------------------------------------------------- sqlite-encrypted
 
 _ENCRYPTED = ("small-encrypted.sqlite", "small-encrypted-v3.sqlite")
