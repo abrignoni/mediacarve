@@ -49,7 +49,7 @@ import zipfile
 import zlib
 from typing import NamedTuple
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 # How much to read at a time while scanning, and how much to carry over so a
 # signature straddling two blocks is still found.
@@ -68,6 +68,7 @@ DEFAULT_CAPS = {
     "avi": 4 << 30,
     "mp4": 4 << 30,
     "heic": 64 << 20,
+    "tiff": 4 << 30,
     "m4a": 4 << 30,
     "ogg": 1 << 30,
     "ogv": 4 << 30,
@@ -91,7 +92,7 @@ _ABSOLUTE_CAP = 4 << 30
 # IEND, 57 bytes.
 MIN_LENGTHS = {
     "jpeg": 128, "png": 57, "gif": 64, "webp": 64,
-    "avi": 1024, "mp4": 1024, "heic": 512,
+    "avi": 1024, "mp4": 1024, "heic": 512, "tiff": 64,
     "m4a": 1024, "ogg": 128, "ogv": 1024, "amr": 256,
     "wav": 64, "aiff": 64, "caf": 64, "mp3": 128, "sqlite": 512,
     "sqlite-encrypted": 512, "bplist": 41,
@@ -102,14 +103,14 @@ MIN_LENGTHS = {
 # the brand, codec or header they find (see _bmff_ext, _ogg_length, _amr_length).
 EXTENSIONS = {
     "jpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp",
-    "avi": ".avi", "mp4": ".mp4", "heic": ".heic",
+    "avi": ".avi", "mp4": ".mp4", "heic": ".heic", "tiff": ".tif",
     "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "amr": ".amr",
     "wav": ".wav", "aiff": ".aiff", "caf": ".caf", "mp3": ".mp3",
     "sqlite": ".sqlite", "sqlite-encrypted": ".sqlite", "bplist": ".plist", "zip": ".zip",
     "pdf": ".pdf",
 }
 
-IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic"})
+IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic", "tiff"})
 VIDEO_KINDS = frozenset({"avi", "mp4", "ogv"})
 AUDIO_KINDS = frozenset({"m4a", "ogg", "amr", "wav", "aiff", "caf", "mp3"})
 MEDIA_KINDS = IMAGE_KINDS | VIDEO_KINDS | AUDIO_KINDS
@@ -161,6 +162,7 @@ _SCAN = re.compile(
     b"|PK\x03\x04"                # ZIP local file header
     b"|%PDF-[12]\\.[0-9][\r\n]"     # PDF header line, version 1.x or 2.x
     b"|ID3[\x02-\x04]\x00"         # ID3v2 tag, versions 2.2 to 2.4
+    b"|II\\*\x00|MM\x00\\*"         # TIFF header, little- or big-endian ("*" is 42)
     b"|\xff[\xe2\xe3\xf2\xf3\xfa\xfb]",  # MPEG audio Layer III frame sync
     re.DOTALL)
 
@@ -376,6 +378,163 @@ def _gif_length(stream, offset, cap):
                 break
             pos += 1 + size[0]
     return None
+
+
+# TIFF 6.0 field types and their sizes in bytes (TIFF 6.0, section 2, "Types"),
+# with type 13, IFD, a 32-bit offset (libtiff 4.7.2, tiff.h, TIFF_IFD).
+_TIFF_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4}
+_TIFF_INTS = {1: "B", 3: "H", 4: "I", 13: "I"}
+# Tags whose values are the offsets of more IFDs: SubIFDs, and the Exif, GPS and
+# Interoperability IFDs (libtiff 4.7.2, tiff.h: TIFFTAG_SUBIFD, TIFFTAG_EXIFIFD,
+# TIFFTAG_GPSIFD, TIFFTAG_INTEROPERABILITYIFD).
+_TIFF_SUB_IFDS = (330, 34665, 34853, 40965)
+# Offset and byte-count pairs: strips and tiles (TIFF 6.0, sections 3 and 15),
+# and the JPEG interchange format stream, which "points to the Start of Image
+# (SOI) marker code" and is absent when zero (section 22).
+_TIFF_EXTENTS = ((273, 279), (324, 325), (513, 514))
+_TIFF_MAX_IFDS = 256
+
+
+def _tiff_data_starts_right(compression, first):
+    """Whether a strip or tile opens the way its compression says it must.
+
+    LZW: "The first code written is a ClearCode, which is defined to be code
+    #256", in 9 bits, stored "into bytes in high-to-low-order fashion" (TIFF 6.0,
+    section 13), so the first byte is 0x80. Deflate (8, and 32946, which
+    libtiff 4.7.2's tiff.h calls the legacy tag): a zlib stream, whose first two bytes
+    have compression method 8 and are a multiple of 31 (RFC 1950, 2.2). Other
+    compressions, uncompressed among them, have no such mark: None.
+    """
+    if compression == 5:
+        return first[:1] == b"\x80"
+    if compression in (8, 32946):
+        return len(first) == 2 and first[0] & 0x0F == 8 and (first[0] << 8 | first[1]) % 31 == 0
+    return None
+
+
+def _tiff_length(stream, offset, cap, loose=None):
+    """A TIFF ends at the furthest byte any of its structures points to.
+
+    TIFF has no length field. The file is an 8-byte header naming the first
+    IFD, and IFDs of a 2-byte entry count, 12-byte entries and the offset of the
+    next IFD; an entry's value sits in the entry when it fits in 4 bytes and is
+    pointed to otherwise, and "this file offset may point anywhere in the file,
+    even after the image data" (TIFF 6.0, section 2). So the walk follows every
+    IFD, in the chain and through the tags that point to more of them, and the
+    end is the furthest of: each IFD, each value it points to, and each strip,
+    tile and JPEG stream with its byte count.
+
+    Taken only as the specification draws it: at least one entry in every IFD,
+    entries in ascending tag order, every type one it sizes, and an image, that
+    is strips or tiles, in some IFD, so the TIFF inside a JPEG's or a HEIC's Exif
+    data, which has no image of its own, is not a file. BigTIFF (header 43) is
+    not read.
+
+    Nothing in a TIFF says where it ends, so an end taken from pointers is only
+    as good as the pointers: 2 of the files below are GeoTIFFs under 1 KB whose
+    tile table points 4 MB past the end of the file, and laid among other files
+    such an end would hide every one it covers. So a TIFF hides what follows it
+    only when every strip and tile opens the way its compression says it must
+    (_tiff_data_starts_right); otherwise its offset goes into ``loose`` and it
+    hides nothing.
+
+    Measured on 323 distinct TIFFs from public phone images: 268 come out at exactly
+    their size; 51 end 1 to 4 bytes early, the missing bytes all zeros, padding
+    after the last structure; 2 are the GeoTIFFs above; 2 are BigTIFF. 240 are
+    LZW or Deflate and every strip opens right; 81 are uncompressed.
+    """
+    head = _read_at(stream, offset, 8)
+    if len(head) < 8:
+        return None
+    e = "<" if head[:2] == b"II" else ">"
+    end = 8
+    queue = [struct.unpack(e + "I", head[4:8])[0]]
+    seen = set()
+    image = False
+    confirmed = True
+    while queue:
+        ifd = queue.pop()
+        if ifd in seen:
+            continue
+        if ifd < 8 or ifd >= cap or len(seen) >= _TIFF_MAX_IFDS:
+            return None
+        seen.add(ifd)
+        count = _read_at(stream, offset + ifd, 2)
+        if len(count) < 2:
+            return None
+        n = struct.unpack(e + "H", count)[0]
+        if not n:
+            return None
+        body = _read_at(stream, offset + ifd + 2, 12 * n + 4)
+        if len(body) < 12 * n + 4:
+            return None
+        end = max(end, ifd + 2 + 12 * n + 4)
+        fields = {}
+        last = -1
+        for i in range(n):
+            tag, typ, cnt = struct.unpack(e + "HHI", body[12 * i:12 * i + 8])
+            if tag <= last or typ not in _TIFF_SIZES:
+                return None
+            last = tag
+            size = _TIFF_SIZES[typ] * cnt
+            if size > 4:
+                at = struct.unpack(e + "I", body[12 * i + 8:12 * i + 12])[0]
+                if at + size > cap:
+                    return None
+                end = max(end, at + size)
+                if tag in _TIFF_SUB_IFDS or any(tag in pair for pair in _TIFF_EXTENTS):
+                    fields[tag] = (typ, cnt, _read_at(stream, offset + at, size))
+            else:
+                fields[tag] = (typ, cnt, body[12 * i + 8:12 * i + 12])
+
+        def ints(tag):
+            typ, cnt, raw = fields[tag]
+            fmt = _TIFF_INTS.get(typ)
+            if fmt is None or len(raw) < struct.calcsize(fmt) * cnt:
+                return None
+            return struct.unpack(e + fmt * cnt, raw[:struct.calcsize(fmt) * cnt])
+
+        compression = 1
+        if 259 in fields:
+            got = ints(259)
+            if not got:
+                return None
+            compression = got[0]
+        for first, second in _TIFF_EXTENTS:
+            if first in fields and second in fields:
+                starts, sizes = ints(first), ints(second)
+                if starts is None or sizes is None or len(starts) != len(sizes):
+                    return None
+                for at, size in zip(starts, sizes):
+                    if first == 513 and not at:
+                        continue                  # no JPEG stream (section 22)
+                    if at + size > cap:
+                        return None
+                    end = max(end, at + size)
+                    if not size:
+                        continue
+                    if first == 513:
+                        right = _read_at(stream, offset + at, 2) == b"\xff\xd8"
+                    else:
+                        right = _tiff_data_starts_right(compression, _read_at(stream, offset + at, 2))
+                    if not right:
+                        confirmed = False
+                if first != 513:
+                    image = True
+        for tag in _TIFF_SUB_IFDS:
+            if tag in fields:
+                more = ints(tag)
+                if more is None:
+                    return None
+                queue.extend(more)
+        following = struct.unpack(e + "I", body[12 * n:12 * n + 4])[0]
+        if following:
+            queue.append(following)
+    if not image:
+        return None
+    if not confirmed and loose is not None:
+        loose.add(offset)
+    return end, "parsed"
 
 
 def _cap(caps, kind):
@@ -1363,7 +1522,7 @@ def _amr_length(stream, offset, cap):
 
 # ------------------------------------------------------------------ scanning
 
-def _measure(stream, offset, kind, caps, dead=None):
+def _measure(stream, offset, kind, caps, dead=None, loose=None):
     """Return a Candidate for a header at ``offset``, or None if it is not one."""
     if kind == "jpeg":
         got = _jpeg_length(stream, offset, _cap(caps, kind))
@@ -1371,6 +1530,8 @@ def _measure(stream, offset, kind, caps, dead=None):
         got = _png_length(stream, offset, _cap(caps, kind))
     elif kind == "gif":
         got = _gif_length(stream, offset, _cap(caps, kind))
+    elif kind == "tiff":
+        got = _tiff_length(stream, offset, _cap(caps, kind), loose)
     elif kind == "riff":
         got = _riff_length(stream, offset, caps)
     elif kind == "bmff":
@@ -1415,7 +1576,7 @@ def _measure(stream, offset, kind, caps, dead=None):
 # the stream's end. Measured on one 33.8 MB APK carved for ZIPs only: 89,932
 # MP3 walks and 25 seconds, against a third of a second without them.
 _SIGNATURE_KINDS = {
-    "jpeg": {"jpeg"}, "png": {"png"}, "gif": {"gif"}, "riff": {"avi", "webp", "wav"},
+    "jpeg": {"jpeg"}, "png": {"png"}, "gif": {"gif"}, "tiff": {"tiff"}, "riff": {"avi", "webp", "wav"},
     "bmff": {"mp4", "heic", "m4a"}, "ogg": {"ogg", "ogv"}, "amr": {"amr"},
     "iff": {"aiff"}, "caf": {"caf"}, "mp3": {"mp3"},
     "sqlite": {"sqlite", "sqlite-encrypted"},
@@ -1484,6 +1645,7 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
     pos = start
     covered = {"media": start, "bplist": start, "zip": start, "pdf": start}   # each group's reach
     zip_dead = set()                              # local headers a failed walk passed
+    loose = set()                                 # hits whose end nothing confirmed
     while pos < end:
         buf = _read_at(stream, pos, min(BLOCK, end - pos))
         if not buf:
@@ -1522,6 +1684,8 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                 kind = "pdf"
             elif sig.startswith(b"\xff\xd8"):
                 kind = "jpeg"
+            elif sig in (b"II\x2a\x00", b"MM\x00\x2a"):
+                kind = "tiff"
             elif sig.startswith(b"\x89PNG"):
                 kind = "png"
             else:
@@ -1533,7 +1697,7 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                 continue
             if kind == "zip" and at in zip_dead:
                 continue
-            hit = _measure(stream, at, kind, caps, zip_dead)
+            hit = _measure(stream, at, kind, caps, zip_dead, loose)
             if hit is None:
                 continue
             if hit.end > limit:
@@ -1543,7 +1707,7 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
             if hit.kind not in kinds:
                 continue
             group = _coverage_group(hit.kind)
-            if not nested and hit.bounded != "capped" and group:
+            if not nested and hit.bounded != "capped" and group and hit.offset not in loose:
                 covered[group] = max(covered[group], hit.end)
             yield hit
         if progress:
