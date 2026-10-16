@@ -69,7 +69,7 @@ mediacarve list  disk.raw -v                 # one line per file: offset, length
 mediacarve carve disk.raw -o carved/         # write the files out
 mediacarve carve disk.raw -o carved.zip      # or into a zip
 mediacarve carve disk.raw -o out/ -k images  # jpeg, png, gif, webp, heic, tiff, bmp, ico
-mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, wav, aiff, caf, mp3
+mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, silk, wav, aiff, caf, mp3
 mediacarve carve disk.raw -o out/ -k databases   # sqlite, sqlite-encrypted
 mediacarve carve disk.raw -o out/ -k plists  # binary plists
 mediacarve carve disk.raw -o out/ -k archives   # zip, apk, ipa, jar, docx...
@@ -164,6 +164,7 @@ dated, path-anchored files.
 | `ogv` | Ogg with a Theora stream | `.ogv` |
 | `mkv` | Matroska and WebM | from the DocType: `.webm`, otherwise `.mkv` |
 | `amr` | AMR and AMR-WB storage files | `.amr`, `.awb` |
+| `silk` | SILK voice (`#!SILK_V3`), as Skype's SDK and WeChat write it | `.silk` |
 | `wav` | WAV (RIFF WAVE) | `.wav` |
 | `aiff` | AIFF and AIFF-C | `.aiff`, `.aifc` |
 | `caf` | Core Audio Format | `.caf` |
@@ -188,9 +189,10 @@ A brand only says what the writer declared: an audio-only file written with the
 generic `mp42` brand is reported as `mp4`, and 29 of 59 distinct `.m4a` files
 from two public Android images were written that way.
 
-Single-channel AMR only. The multi-channel AMR headers, AMR inside 3GP (that is
-ISO-BMFF, and carves as `mp4`), and SILK voice files (`#!SILK_V3`), which one public
-Android image stores under `com.tencent.mm` with an `.amr` name, are not covered.
+Single-channel AMR only. The multi-channel AMR headers and AMR inside 3GP (that is
+ISO-BMFF, and carves as `mp4`) are not covered. SILK voice files (`#!SILK_V3`),
+which one public Android image stores under `com.tencent.mm` with an `.amr` name,
+are their own kind, `silk`.
 
 ## How it was validated
 
@@ -245,7 +247,7 @@ a matching SHA-256 and the expected kind and extension: 179 Ogg Opus, 1 Ogg
 Vorbis, 30 M4A, 33 MP4, 1 3GP and 7 of 8 AMR. The eighth AMR came back one byte
 long: its last frame is a 32-byte frame with 31 bytes in the file, and the byte
 after it completes it. The
-8 SILK files gave no hit. In random bytes the same 244 that are not AMR came back
+8 SILK files gave no AMR hit (SILK is carved as its own kind since 0.14.0). In random bytes the same 244 that are not AMR came back
 exactly, and 6 of the 8 AMR; the other two ran 1 and 6 bytes long. Neither image
 gave a hit anywhere else.
 
@@ -580,6 +582,29 @@ give 15 WebM files, 10 of which FFmpeg reads cleanly. A run takes about as long
 as before.
 
 Each rule was broken in turn and made its own test fail.
+
+**SILK.** A SILK file is "#!SILK_V3" and packets, each a 16-bit little-endian
+byte count and that many bytes. The reference encoder ends a file with a count
+of -1 (SILK SDK 1.0.9.6, test/Encoder.c and test/Decoder.c, as kept in
+kn007/silk-v3-decoder at `507be6b`). That copy's encoder also writes WeChat's
+form, with a byte 0x02 before the header and no -1 at the end, and WeChat's
+files below are that form. So the walk ends at -1, at the end of the data, or
+at the first count no packet can have: 0, or more than the 1,024 bytes the range
+coder's buffer holds (`MAX_ARITHM_BYTES`).
+
+All 11 distinct SILK files from public phone images, 8 from WeChat on Android
+and 3 from iOS ending with -1, come back at exactly their size between zeros
+and between random bytes. None of their 7,180 packets is empty or over 118
+bytes. A WeChat file has no end mark, so random bytes after it can read as one
+more packet: in 500 trials per file, 61 of 4,000 for the WeChat files ran on,
+by up to 1 KiB, close to the 1,024 in 65,536 chance that a random count passes;
+the files ending with -1 stopped there every time. Nothing here decodes SILK, so
+the files were checked against their framing only, and the tests build their
+SILK files from framing with random payloads. None of the eight built volumes
+holds SILK, and none is reported on them, and a run takes as long as before. The
+byte 0x02 is looked for before each "#!SILK_V3" found, not made part of the scan
+pattern: as an optional first byte there it took the scan of 128 MiB from 0.97
+to 4.53 seconds. Each rule was broken in turn and made its own test fail.
 
 **Binary plists.** A binary plist's length is in its trailer, at its end:
 offsetTableOffset + numObjects x offsetIntSize + 32, with the trailer laid out as
