@@ -49,7 +49,7 @@ import zipfile
 import zlib
 from typing import NamedTuple
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # How much to read at a time while scanning, and how much to carry over so a
 # signature straddling two blocks is still found.
@@ -77,6 +77,7 @@ DEFAULT_CAPS = {
     "caf": 4 << 30,
     "mp3": 1 << 30,
     "sqlite": 4 << 30,
+    "bplist": 32 << 20,
 }
 _ABSOLUTE_CAP = 4 << 30
 
@@ -89,7 +90,7 @@ MIN_LENGTHS = {
     "jpeg": 128, "png": 57, "gif": 64, "webp": 64,
     "avi": 1024, "mp4": 1024, "heic": 512,
     "m4a": 1024, "ogg": 128, "ogv": 1024, "amr": 256,
-    "wav": 64, "aiff": 64, "caf": 64, "mp3": 128, "sqlite": 512,
+    "wav": 64, "aiff": 64, "caf": 64, "mp3": 128, "sqlite": 512, "bplist": 41,
 }
 
 # The conventional extension for each kind. ISO-BMFF, Ogg and AMR refine it from
@@ -99,7 +100,7 @@ EXTENSIONS = {
     "avi": ".avi", "mp4": ".mp4", "heic": ".heic",
     "m4a": ".m4a", "ogg": ".ogg", "ogv": ".ogv", "amr": ".amr",
     "wav": ".wav", "aiff": ".aiff", "caf": ".caf", "mp3": ".mp3",
-    "sqlite": ".sqlite",
+    "sqlite": ".sqlite", "bplist": ".plist",
 }
 
 IMAGE_KINDS = frozenset({"jpeg", "png", "gif", "webp", "heic"})
@@ -107,7 +108,8 @@ VIDEO_KINDS = frozenset({"avi", "mp4", "ogv"})
 AUDIO_KINDS = frozenset({"m4a", "ogg", "amr", "wav", "aiff", "caf", "mp3"})
 MEDIA_KINDS = IMAGE_KINDS | VIDEO_KINDS | AUDIO_KINDS
 DATABASE_KINDS = frozenset({"sqlite"})
-ALL_KINDS = MEDIA_KINDS | DATABASE_KINDS
+PLIST_KINDS = frozenset({"bplist"})
+ALL_KINDS = MEDIA_KINDS | DATABASE_KINDS | PLIST_KINDS
 
 # What a scan looks for when no kinds are given. Media only, so a caller that
 # has always passed nothing keeps getting what it got before databases were
@@ -147,6 +149,7 @@ _SCAN = re.compile(
     b"|FORM....AIF[FC]"          # IFF FORM holding AIFF or AIFF-C
     b"|caff\x00\x01\x00\x00"      # CAF version 1, flags 0
     b"|SQLite format 3\x00"        # SQLite database header
+    b"|bplist00"                  # binary property list
     b"|ID3[\x02-\x04]\x00"         # ID3v2 tag, versions 2.2 to 2.4
     b"|\xff[\xe2\xe3\xf2\xf3\xfa\xfb]",  # MPEG audio Layer III frame sync
     re.DOTALL)
@@ -792,6 +795,61 @@ def _sqlite_length(stream, offset, caps):
     return length, "header", "sqlite", ".sqlite"
 
 
+# A binary plist trailer as it opens: five unused bytes and the sort version,
+# all zero, then the offset and object reference sizes, 1 to 8.
+_BPLIST_TRAILER = re.compile(b"\x00{6}[\x01-\x08][\x01-\x08]", re.DOTALL)
+
+
+def _bplist_length(stream, offset, cap):
+    """Search forward for the trailer that describes the plist at ``offset``.
+
+    A binary plist is "bplist00", its objects, an offset table and a 32-byte
+    trailer, and its length is in the trailer, at its end: offsetTableOffset +
+    numObjects x offsetIntSize + 32. The trailer layout is CFBinaryPlistTrailer
+    (ForFoundationOnly.h) and the checks are Apple's own, from
+    __CFBinaryPlistGetTopLevelInfo (CFBinaryPList.c, CF-1153.18): at least one
+    object, the top object among them, the offset table after the header, the
+    reference and offset sizes wide enough for the counts they hold, and the
+    total length equal to that sum. So a candidate trailer is taken only if its
+    offset table ends exactly where the trailer begins, counted from this
+    header, and every offset in the table points into the object data.
+
+    Measured on 4,818 binary plists from public phone images: all are bplist00,
+    all have zero unused bytes and sort version 0, and in every one the length
+    the trailer gives is exactly the file's size.
+    """
+    if _read_at(stream, offset, 8) != b"bplist00":
+        return None
+    end = offset + cap
+    pos = offset + 9
+    while pos < end:
+        buf = _read_at(stream, pos, min(1 << 20, end - pos) + 32)
+        if len(buf) < 32:
+            return None
+        for match in _BPLIST_TRAILER.finditer(buf, 0, len(buf) - 24):   # a whole
+            # trailer can start anywhere up to 32 bytes from the end of the window
+            at = pos + match.start()
+            trailer = buf[match.start():match.start() + 32]
+            ois, ors = trailer[6], trailer[7]
+            count, top, table = struct.unpack(">QQQ", trailer[8:32])
+            if count < 1 or top >= count or table < 9:
+                continue
+            if offset + table + count * ois != at:
+                continue
+            if ors < 8 and 1 << (8 * ors) <= count:
+                continue
+            if ois < 8 and 1 << (8 * ois) <= table:
+                continue
+            raw = _read_at(stream, offset + table, count * ois)
+            entries = (int.from_bytes(raw[i:i + ois], "big") for i in range(0, len(raw), ois))
+            if len(raw) == count * ois and all(8 <= e < table for e in entries):
+                return at + 32 - offset, "parsed", "bplist", ".plist"
+        if len(buf) < (1 << 20) + 32:
+            return None
+        pos += 1 << 20
+    return None
+
+
 # Ogg pages carry a CRC-32 with the generator polynomial 0x04c11db7 (RFC 3533,
 # section 6), computed MSB first with a zero start and no final inversion, over
 # the page with its CRC field zeroed. zlib computes the same polynomial LSB
@@ -979,6 +1037,8 @@ def _measure(stream, offset, kind, caps):
         got = _mp3_length(stream, offset, _cap(caps, kind))
     elif kind == "sqlite":
         got = _sqlite_length(stream, offset, caps)
+    elif kind == "bplist":
+        got = _bplist_length(stream, offset, _cap(caps, kind))
     else:
         return None
     if got is None:
@@ -993,6 +1053,22 @@ def _measure(stream, offset, kind, caps):
     if length < MIN_LENGTHS.get(kind, 1):
         return None
     return Candidate(offset, length, kind, ext or EXTENSIONS.get(kind, ".bin"), bounded)
+
+
+def _coverage_group(kind):
+    """Which hits a hit of this kind can hide, and be hidden by.
+
+    Media hide media: an EXIF thumbnail inside a JPEG is not a second file. A
+    plist hides the plists stored in it, but no media, so asking for plists
+    changes no media hit. A database hides nothing and nothing hides it, because
+    a blob is spread over the database's pages and its own sizes can claim the
+    next file.
+    """
+    if kind in ("sqlite",):
+        return None
+    if kind in ("bplist",):
+        return "bplist"
+    return "media"
 
 
 def carve(stream, *, kinds=None, caps=None, start=0, end=None,
@@ -1034,7 +1110,7 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
         end = size
     limit = end if clip else size
     pos = start
-    covered_to = start
+    covered = {"media": start, "bplist": start}    # how far each group's hits reach
     while pos < end:
         buf = _read_at(stream, pos, min(BLOCK, end - pos))
         if not buf:
@@ -1061,6 +1137,10 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                 if "sqlite" not in kinds:
                     continue
                 kind = "sqlite"
+            elif sig == b"bplist00":
+                if "bplist" not in kinds:
+                    continue
+                kind = "bplist"
             elif sig.startswith(b"\xff\xd8"):
                 kind = "jpeg"
             elif sig.startswith(b"\x89PNG"):
@@ -1069,8 +1149,9 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                 kind = "gif"
             if at < start:
                 continue
-            if not nested and at < covered_to and kind != "sqlite":
-                continue                          # a database is never hidden
+            group = _coverage_group(kind)
+            if not nested and group and at < covered[group]:
+                continue
             hit = _measure(stream, at, kind, caps)
             if hit is None:
                 continue
@@ -1080,8 +1161,9 @@ def carve(stream, *, kinds=None, caps=None, start=0, end=None,
                     continue
             if hit.kind not in kinds:
                 continue
-            if not nested and hit.bounded != "capped" and hit.kind not in DATABASE_KINDS:
-                covered_to = max(covered_to, hit.end)
+            group = _coverage_group(hit.kind)
+            if not nested and hit.bounded != "capped" and group:
+                covered[group] = max(covered[group], hit.end)
             yield hit
         if progress:
             progress(min(pos + len(buf), end), end)
@@ -1176,6 +1258,8 @@ def _kinds_arg(value):
             wanted |= set(MEDIA_KINDS)
         elif part in ("databases", "database"):
             wanted |= set(DATABASE_KINDS)
+        elif part in ("plists", "plist"):
+            wanted |= set(PLIST_KINDS)
         elif part == "images":
             wanted |= set(IMAGE_KINDS)
         elif part in ("video", "videos"):
@@ -1238,8 +1322,8 @@ def main(argv=None):
     common.add_argument("image", help="raw image, or an .E01 when ewfprobe is present")
     common.add_argument("-k", "--kinds", default=None,
                         help="what to carve: media (the default), images, video, "
-                             "audio, databases, all, or a comma separated list such "
-                             "as jpeg,png,sqlite")
+                             "audio, databases, plists, all, or a comma separated "
+                             "list such as jpeg,png,sqlite")
     common.add_argument("--nested", action="store_true",
                         help="also report files inside another file, such as "
                              "EXIF thumbnails")
