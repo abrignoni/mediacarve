@@ -1,8 +1,8 @@
 # mediacarve
 
-Recover images, video, audio and, when asked, SQLite databases, binary plists and
-ZIP archives (APK, IPA, JAR, Office and OpenDocument files among them) from any
-stream of bytes, by signature. One file, pure
+Recover images, video, audio and, when asked, SQLite databases, binary plists, ZIP
+archives (APK, IPA, JAR, Office and OpenDocument files among them) and PDFs from
+any stream of bytes, by signature. One file, pure
 Python, standard library only. No compiler, no network, nothing to install.
 
 ```python
@@ -72,7 +72,8 @@ mediacarve carve disk.raw -o out/ -k audio   # m4a, ogg, amr, wav, aiff, caf, mp
 mediacarve carve disk.raw -o out/ -k databases   # sqlite
 mediacarve carve disk.raw -o out/ -k plists  # binary plists
 mediacarve carve disk.raw -o out/ -k archives   # zip, apk, ipa, jar, docx...
-mediacarve carve disk.raw -o out/ -k all     # media, databases, plists, archives
+mediacarve carve disk.raw -o out/ -k documents  # pdf
+mediacarve carve disk.raw -o out/ -k all     # everything above
 ```
 
 ## Lengths are parsed, not guessed
@@ -164,16 +165,17 @@ dated, path-anchored files.
 | `mp3` | MPEG audio Layer III, with ID3v2, APEv2 and ID3v1 tags | `.mp3` |
 | `sqlite` | SQLite 3 database (asked for with `-k databases` or `-k all`) | `.sqlite` |
 | `bplist` | binary property list, bplist00 (asked for with `-k plists` or `-k all`) | `.plist` |
+| `pdf` | PDF (asked for with `-k documents` or `-k all`) | `.pdf` |
 | `zip` | ZIP and the formats built on it (asked for with `-k archives` or `-k all`) | from the entry names: `.apk`, `.ipa`, `.jar`, `.docx`, `.xlsx`, `.pptx`, `.epub`, `.odt`, `.ods`, `.odp`, otherwise `.zip` |
 
 `-k images`, `-k video` and `-k audio` select the groups. Without `-k`, and with
 `kinds` left out of `carve()`, the media kinds are carved and nothing else, so a
 caller gets what it got before databases were added. `-k databases` adds SQLite,
-`-k plists` adds binary plists, `-k archives` adds ZIP, and `-k all` carves
-everything. A database hides
+`-k plists` adds binary plists, `-k archives` adds ZIP, `-k documents` adds PDF,
+and `-k all` carves everything. A database hides
 nothing found inside it, and nothing hides a database. A plist hides the plists
-stored in it, and a ZIP the ZIPs stored in it, but neither hides media, so asking
-for them changes no media hit. The brand is read from
+stored in it, a ZIP the ZIPs and a PDF the PDFs, but none of them hides media, so
+asking for them changes no media hit: a PDF's page images are still JPEGs. The brand is read from
 the `ftyp` box against the [MP4 registration authority's list](https://github.com/mp4ra/mp4ra.github.io/blob/35c6ffec3216d1d0d50671a68509ec4ddbf3c9b5/data/brands.csv).
 A brand only says what the writer declared: an audio-only file written with the
 generic `mp42` brand is reported as `mp4`, and 29 of 59 distinct `.m4a` files
@@ -510,6 +512,39 @@ width and the zero skip only make the walk reach the directory without reading
 every byte; the end record decides, so their test is that the walk passes every
 entry. That the directory ends where the end record begins could not be shown
 alone, because breaking it breaks the pointing-back check first.
+
+**PDF.** A PDF ends at the %%EOF whose startxref points back into it (ISO 32000-1
+7.5.5): the offset it gives, counted from the header, has to land on an `xref`
+keyword or a cross-reference stream object (7.5.8). An incremental update
+appends objects, a cross-reference section and its own %%EOF (7.5.6), so after a
+valid %%EOF the scan carries on if what follows is more of the file: an object
+or an `xref` section, after white space and comment lines. A linearized file's
+first-page trailer may end in `startxref 0` (Annex F.3.4), which lands on the
+header and so is never taken as the end. The header has to be on its own line
+(7.5.2).
+
+On 1,294 PDFs from public phone images, laid between zeros and again between
+random bytes, all 1,294 came back at exactly their size between zeros, and 1,292
+between random bytes. 310 of them end in %%EOF with no line break; when the next
+byte happens to be a carriage return or line feed, which it was for 2, the PDF
+comes back one byte long. That run found ExifTool opening its incremental update
+with the comment line `%BeginExifToolUpdate`; until comments were allowed the
+file came back 3,365 bytes short.
+
+On the volumes there are few PDFs: one on each Takeout volume and one on each
+Android ext4 volume, each at exactly its size in the file table and read by
+`pypdf` in strict mode; PhotoRec returns the Takeout one at the same size. Two
+`%PDF-1.4` header lines in native libraries inside Android APKs, a PDF writer's
+template strings, are not reported. A run without `-k` is the same, hit for hit,
+as 0.8.0, and asking for documents changes no other hit. Media inside PDFs, such
+as the 688 JPEG page images in the 1,294, is reported whether or not documents
+are asked for.
+
+Each PDF rule was broken in turn and made its own test fail: documents only when
+asked for, a PDF hiding the PDFs in it but no media, startxref pointing back, a
+cross-reference stream as a target (pypdf's incremental update writes one),
+carrying on after an update, comment lines before one, and the header's line
+break.
 
 ## Tests
 
