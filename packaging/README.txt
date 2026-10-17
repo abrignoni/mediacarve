@@ -10,7 +10,10 @@ mediacarve, built as standalone executables
                       On Windows write mediacarve.exe; on macOS and Linux write
                       ./mediacarve from this folder. It reads a raw image or an
                       EnCase .E01 (through the ewfprobe it carries) and finds
-                      images and video by signature.
+                      images, video and audio by signature. With -k it also
+                      finds databases, plists, archives and documents, for
+                      example -k media,databases or -k all;
+                      mediacarve carve --help lists them.
 
   mediacarve_gui      the same tool in a window (mediacarve_gui.exe on Windows,
                       mediacarve_gui.app on macOS). Choose an image, then Count

@@ -2205,8 +2205,8 @@ def _cmd_carve(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="mediacarve",
-        description="Recover images, video, audio and, when asked, databases from a "
-                    "disk image by signature. "
+        description="Recover images, video, audio and, when asked, databases, plists, "
+                    "archives and documents from a disk image by signature. "
                     "Read only.")
     ap.add_argument("--version", action="version", version=f"mediacarve {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
