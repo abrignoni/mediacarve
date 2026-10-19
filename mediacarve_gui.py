@@ -103,14 +103,15 @@ def build_window(initial_image="", smoke=None):
     ttk.Button(out_buttons, text="Zip...", command=lambda: v_output.set(
         filedialog.asksaveasfilename(title="Output zip", defaultextension=".zip",
                                      filetypes=[("Zip", "*.zip")]) or v_output.get())).pack(side="left", padx=(4, 0))
+    # The option rows span the button column too, so they fit the minimum window width.
     options = ttk.Frame(form)
-    options.grid(row=2, column=1, sticky="w", pady=(4, 0))
+    options.grid(row=2, column=1, columnspan=2, sticky="w", pady=(4, 0))
     ttk.Label(options, text="Kinds").pack(side="left")
     ttk.Combobox(options, textvariable=v_kinds, values=KINDS, width=24).pack(side="left", padx=(6, 12))
     ttk.Label(options, text="(or a list: media,databases or jpeg,png)",
               foreground="gray").pack(side="left")
-    ttk.Checkbutton(options, text="Also files inside other files (EXIF thumbnails)",
-                    variable=v_nested).pack(side="left", padx=(12, 0))
+    ttk.Checkbutton(form, text="Also files inside other files (EXIF thumbnails)",
+                    variable=v_nested).grid(row=3, column=1, columnspan=2, sticky="w", pady=(4, 0))
     form.columnconfigure(1, weight=1)
 
     buttons = ttk.Frame(root, padding=(8, 0))
@@ -129,8 +130,14 @@ def build_window(initial_image="", smoke=None):
     status = ttk.Label(status_bar, text="Choose an image.", width=40)
     status.pack(side="left", padx=(8, 0))
 
-    log = tk.Text(root, wrap="none", state="disabled")
-    log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    # Wrap long lines (the command and output paths) instead of hiding their ends.
+    log_frame = ttk.Frame(root, padding=(8, 0, 8, 8))
+    log_frame.pack(fill="both", expand=True)
+    log = tk.Text(log_frame, wrap="word", state="disabled")
+    log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=log.yview)
+    log.configure(yscrollcommand=log_scroll.set)
+    log_scroll.pack(side="right", fill="y")
+    log.pack(side="left", fill="both", expand=True)
 
     def write(text):
         log.configure(state="normal")
