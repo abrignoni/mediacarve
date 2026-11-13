@@ -4,11 +4,11 @@ mediacarve {{VERSION}}: standalone executables of `mediacarve.py` and its window
 - `mediacarve-{{VERSION}}-windows-arm64.zip` is native for Windows on ARM.
 - `mediacarve-{{VERSION}}-macos-arm64.zip` for Apple silicon Macs, `mediacarve-{{VERSION}}-macos-x64.zip` for Intel Macs.
 - `mediacarve-{{VERSION}}-linux-x64.tar.gz` and `mediacarve-{{VERSION}}-linux-arm64.tar.gz`, built on Ubuntu 22.04 so they run on distributions with a glibc at least that old.
-- `mediacarve.py` and `mediacarve_gui.py`, the tagged source files themselves.
+- `mediacarve.py`, `mediacarve_gui.py` and `mediacarve_theme.py`, the tagged source files themselves (the window needs the last two beside `mediacarve.py`).
 
-Each archive holds the command line tool, the window (`mediacarve_gui`), `README.txt`, `LICENSE`, `LICENSE-ewfprobe` and `SHA256SUMS.txt`. The executables carry ewfprobe {{EWFPROBE}} so they read `.E01` images. `SHA256SUMS.txt` beside the archives covers the archives and the two source files.
+Each archive holds the command line tool, the window (`mediacarve_gui`), `README.txt`, `LICENSE`, `LICENSE-ewfprobe` and `SHA256SUMS.txt`. The executables carry ewfprobe {{EWFPROBE}} so they read `.E01` images. `SHA256SUMS.txt` beside the archives covers the archives and the three source files.
 
-Before they were attached, each executable was run on a raw image built from the repository's media fixtures and on an E01 from ewfprobe's fixtures, and it printed and wrote the same bytes as `python mediacarve.py`: the listings, the carved files and the zip's members. The window re-enters itself with `--cli` to run the tool; that call went through the same comparison, and the window was started and checked to stay up.
+Before they were attached, each executable was run on a raw image built from the repository's media fixtures and on an E01 from ewfprobe's fixtures, and it printed and wrote the same bytes as `python mediacarve.py`: the listings, the carved files and the zip's members. The window re-enters itself with `--cli` to run the tool; that call went through the same comparison, and the window was started and checked to stay up, and to carve a test image with its logo and icon loaded.
 
 None of the executables is code signed: Windows SmartScreen and macOS Gatekeeper will each ask once, and the README inside says what to do.
 

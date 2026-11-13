@@ -36,6 +36,10 @@ library only. Choose an image, optionally limit the kinds, then **Count** to lis
 file found or **Carve** to write them to a folder or zip, with a progress bar. The window
 runs `mediacarve.py` and shows what it prints, so the results are the same either way.
 
+It needs `mediacarve_theme.py` beside it (colours and the header, also standard library). The
+logo comes from `assets/`; without that folder the window opens with no logo. It starts in
+the system's light or dark mode, and the switch in its header changes it for that session.
+
 ## Standalone executables
 
 Each [release](https://github.com/abrignoni/mediacarve/releases) carries `mediacarve`

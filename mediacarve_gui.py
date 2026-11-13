@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """mediacarve GUI: a tkinter window over mediacarve.py.
 
-Standard library only, like the tool it drives. The window runs the command line
+Standard library only, like the tool it drives. Its colours, header and logo come
+from mediacarve_theme.py and assets/ beside it (the logo is left out when assets/ is
+missing). The window runs the command line
 tool as a subprocess with the same options it takes, so what it shows is what the
 command line prints:
 
@@ -35,6 +37,7 @@ import threading
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import mediacarve  # noqa: E402  pylint: disable=wrong-import-position
+import mediacarve_theme  # noqa: E402  pylint: disable=wrong-import-position
 
 TITLE = "mediacarve"
 KINDS = ("media", "images", "video", "audio", "databases", "plists", "archives",
@@ -76,68 +79,80 @@ def build_window(initial_image="", smoke=None):
 
     root = tk.Tk()
     root.title(f"{TITLE} {mediacarve.__version__}")
-    root.geometry("900x620")
-    root.minsize(700, 460)
+    root.geometry("940x680")
+    root.minsize(740, 520)
     if smoke:
         root.attributes("-alpha", 0.0)
-    state = {"proc": None, "streams": 0, "mode": None, "result": None}
+    theme = mediacarve_theme.Theme(root)
+    theme.apply(mediacarve_theme.system_dark())
+    assets = mediacarve_theme.assets_dir(HERE)
+    state = {"proc": None, "streams": 0, "mode": None, "result": None,
+             "icon": mediacarve_theme.window_icon(root, assets, TITLE)}
     lines = queue.Queue()
 
-    form = ttk.Frame(root, padding=8)
-    form.pack(fill="x")
+    head, _right = theme.header(root, TITLE, f"{mediacarve.__version__}   files by their signatures",
+                                logo_folder=assets, on_mode=theme.apply)
+    head.pack(fill="x")
+    state["logo"] = theme.logo is not None
+    page = ttk.Frame(root, padding=(18, 14, 18, 16))
+    page.pack(fill="both", expand=True)
+
+    card, form = theme.card(page)
+    card.pack(fill="x")
     v_image = tk.StringVar(value=initial_image)
     v_output = tk.StringVar()
     v_kinds = tk.StringVar(value="media")
     v_nested = tk.BooleanVar(value=False)
 
-    ttk.Label(form, text="Image").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
-    ttk.Entry(form, textvariable=v_image).grid(row=0, column=1, sticky="ew", pady=2)
+    ttk.Label(form, text="Image", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
+    ttk.Entry(form, textvariable=v_image).grid(row=0, column=1, sticky="ew", pady=3)
     ttk.Button(form, text="Browse...", command=lambda: v_image.set(
-        filedialog.askopenfilename(title="Image") or v_image.get())).grid(row=0, column=2, padx=(6, 0))
-    ttk.Label(form, text="Output").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
-    ttk.Entry(form, textvariable=v_output).grid(row=1, column=1, sticky="ew", pady=2)
-    out_buttons = ttk.Frame(form)
-    out_buttons.grid(row=1, column=2, padx=(6, 0), sticky="w")
+        filedialog.askopenfilename(title="Image") or v_image.get())).grid(row=0, column=2, padx=(8, 0), sticky="w")
+    ttk.Label(form, text="Output", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
+    ttk.Entry(form, textvariable=v_output).grid(row=1, column=1, sticky="ew", pady=3)
+    out_buttons = ttk.Frame(form, style="Header.TFrame")
+    out_buttons.grid(row=1, column=2, padx=(8, 0), sticky="w")
     ttk.Button(out_buttons, text="Folder...", command=lambda: v_output.set(
         filedialog.askdirectory(title="Output folder") or v_output.get())).pack(side="left")
     ttk.Button(out_buttons, text="Zip...", command=lambda: v_output.set(
         filedialog.asksaveasfilename(title="Output zip", defaultextension=".zip",
-                                     filetypes=[("Zip", "*.zip")]) or v_output.get())).pack(side="left", padx=(4, 0))
+                                     filetypes=[("Zip", "*.zip")]) or v_output.get())).pack(side="left", padx=(6, 0))
     # The option rows span the button column too, so they fit the minimum window width.
-    options = ttk.Frame(form)
-    options.grid(row=2, column=1, columnspan=2, sticky="w", pady=(4, 0))
-    ttk.Label(options, text="Kinds").pack(side="left")
-    ttk.Combobox(options, textvariable=v_kinds, values=KINDS, width=24).pack(side="left", padx=(6, 12))
+    options = ttk.Frame(form, style="Header.TFrame")
+    options.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0))
+    ttk.Label(options, text="Kinds", style="Card.TLabel").pack(side="left")
+    ttk.Combobox(options, textvariable=v_kinds, values=KINDS, width=24).pack(side="left", padx=(8, 12))
     ttk.Label(options, text="(or a list: media,databases or jpeg,png)",
-              foreground="gray").pack(side="left")
-    ttk.Checkbutton(form, text="Also files inside other files (EXIF thumbnails)",
-                    variable=v_nested).grid(row=3, column=1, columnspan=2, sticky="w", pady=(4, 0))
+              style="CardMuted.TLabel").pack(side="left")
+    ttk.Checkbutton(form, text="Also files inside other files (EXIF thumbnails)", style="Card.TCheckbutton",
+                    variable=v_nested).grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 0))
     form.columnconfigure(1, weight=1)
 
-    buttons = ttk.Frame(root, padding=(8, 0))
-    buttons.pack(fill="x")
+    buttons = ttk.Frame(page)
+    buttons.pack(fill="x", pady=(14, 0))
+    b_carve = ttk.Button(buttons, text="Carve", style="Primary.TButton")
     b_count = ttk.Button(buttons, text="Count")
-    b_carve = ttk.Button(buttons, text="Carve")
     b_cancel = ttk.Button(buttons, text="Cancel", state="disabled")
     b_open = ttk.Button(buttons, text="Open output", state="disabled")
-    for button in (b_count, b_carve, b_cancel, b_open):
-        button.pack(side="left", padx=(0, 6))
+    for button in (b_carve, b_count, b_cancel, b_open):
+        button.pack(side="left", padx=(0, 8))
 
-    status_bar = ttk.Frame(root, padding=(8, 6))
-    status_bar.pack(fill="x")
+    status_bar = ttk.Frame(page)
+    status_bar.pack(fill="x", pady=(12, 10))
     progress = ttk.Progressbar(status_bar, mode="determinate", maximum=100)
     progress.pack(side="left", fill="x", expand=True)
-    status = ttk.Label(status_bar, text="Choose an image.", width=40)
-    status.pack(side="left", padx=(8, 0))
+    status = ttk.Label(status_bar, text="Choose an image.", width=40, style="Muted.TLabel")
+    status.pack(side="left", padx=(12, 0))
 
     # Wrap long lines (the command and output paths) instead of hiding their ends.
-    log_frame = ttk.Frame(root, padding=(8, 0, 8, 8))
+    log_frame = ttk.Frame(page)
     log_frame.pack(fill="both", expand=True)
-    log = tk.Text(log_frame, wrap="word", state="disabled")
+    log = tk.Text(log_frame, wrap="word", state="disabled", padx=10, pady=8)
     log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=log.yview)
     log.configure(yscrollcommand=log_scroll.set)
     log_scroll.pack(side="right", fill="y")
     log.pack(side="left", fill="both", expand=True)
+    theme.apply(theme.dark)   # colours the Text made after the first apply
 
     def write(text):
         log.configure(state="normal")
@@ -243,7 +258,7 @@ def build_window(initial_image="", smoke=None):
             status["text"] = "cancelled"
         else:
             status["text"] = f"mediacarve exited {code}"
-        state["result"] = (code, state.get("written", 0))
+        state["result"] = (code, state.get("written", 0), state["logo"], state["icon"])
         if smoke:
             root.after(10, root.destroy)
 
@@ -283,8 +298,9 @@ def main(argv):
         if len(argv) != 3:
             print("usage: mediacarve_gui.py --smoke IMAGE OUTPUT", file=sys.stderr)
             return 2
-        code, written = build_window(smoke=(os.path.abspath(argv[1]), os.path.abspath(argv[2]))) or (None, 0)
-        print(json.dumps({"exit": code, "written": written}))
+        code, written, logo, icon = (build_window(smoke=(os.path.abspath(argv[1]), os.path.abspath(argv[2])))
+                                     or (None, 0, False, False))
+        print(json.dumps({"exit": code, "written": written, "logo": logo, "icon": icon}))
         return 0 if code == 0 else 1
     build_window(os.path.abspath(argv[0]) if argv and os.path.exists(argv[0]) else "")
     return 0
