@@ -37,8 +37,8 @@ file found or **Carve** to write them to a folder or zip, with a progress bar. T
 runs `mediacarve.py` and shows what it prints, so the results are the same either way.
 
 It needs `mediacarve_theme.py` beside it (colours and the header, also standard library). The
-logo comes from `assets/`; without that folder the window opens with no logo. It starts in
-the system's light or dark mode, and the switch in its header changes it for that session.
+logo comes from `assets/`; without that folder the window opens with no logo. It starts in the system's light or dark mode where it can read it (macOS, Windows, and
+GNOME's setting on Linux), otherwise light, and the switch in its header changes it for that session.
 
 ## Standalone executables
 
