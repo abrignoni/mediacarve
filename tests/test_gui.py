@@ -52,7 +52,7 @@ def test_hidden_window_carves(image, tmp_path, name):
     output = tmp_path / name
     result = run(GUI, "--smoke", str(image), str(output))
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout.strip().splitlines()[-1]) == {"exit": 0, "written": len(MEDIA)}
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {"exit": 0, "written": len(MEDIA), "logo": True, "icon": True}
     if name.endswith(".zip"):
         assert len(zipfile.ZipFile(output).namelist()) == len(MEDIA)
     else:
